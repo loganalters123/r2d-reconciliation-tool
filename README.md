@@ -4,7 +4,7 @@ A user-friendly web interface for the R2D reconciliation tool. Non-technical use
 
 ## 🚀 Quick Start (Streamlit Community Cloud)
 
-1. **Visit the deployed app**: [https://r2d-reconciliation-tool.streamlit.app](https://r2d-reconciliation-tool.streamlit.app)
+1. **Visit the deployed app**: (https://r2d-reconciliation-tool-v78hhyxf4pyqzpz66drnue.streamlit.app/)
 2. **Upload your Excel file** with R2D and Chase sheets
 3. **Configure sheet names** (defaults: "Repayments to Date" and "Chase")
 4. **Click "Run Reconciliation"**
