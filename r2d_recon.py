@@ -13,10 +13,8 @@ AMOUNT_TOL = 0.01  # 1 cent
 
 TRANSFER_HINTS = re.compile(r"(?:dwolla|transfer|ach|orig co name|orig id|trn)", re.I)
 OVERPAY_DEBIT_HINTS = re.compile(r"(?:2670|transfer)", re.I)
-OVERPAID_REGEX = re.compile(
-    r"(?:overpaid\s*(?:by)?|overpayment\s*(?:of)?)\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})",
-    re.I
-)
+# liberal: "overpaid by $X" OR "overpayment of $X" OR "overpayment $X"
+OVERPAID_REGEX = re.compile(r"(?:overpaid\s*(?:by)?|overpayment\s*(?:of)?)\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", re.I)
 PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
 DOLLAR_REGEX = re.compile(r"\$?\s*([0-9][0-9,]*\.\d{2})")
 DATE_IN_NOTES = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
@@ -117,15 +115,15 @@ def load_chase(path, sheet):
     out["has_hint"] = out["description"].str.contains(TRANSFER_HINTS, na=False, regex=True)
     out["overpay_hint"] = out["description"].str.contains(OVERPAY_DEBIT_HINTS, na=False, regex=True)
 
-    # Normalize ReconTag safely (no astype(str) emptiness bug)
+    # Normalize ReconTag robustly
     if m.get("recon_tag"):
-        rt = df[m["recon_tag"]].astype(object)
+        series = df[m["recon_tag"]].astype(object)
         def _norm(x):
             if x is None or (isinstance(x, float) and pd.isna(x)):
                 return None
             s = str(x).strip()
             return None if s == "" or s.lower() in {"nan", "none"} else s
-        out["recon_tag"] = rt.map(_norm)
+        out["recon_tag"] = series.map(_norm)
     else:
         out["recon_tag"] = pd.NA
     return out
@@ -261,31 +259,43 @@ def match_credits_one_row_per_claim(r2d, chase):
         ref_date = r["ref_date"]
         over_x = r2(r.get("overpaid_sum") or 0.0) if pd.notna(r.get("overpaid_sum")) else 0.0
 
+        # Wider window when we have an overpay (checks lag more)
+        win_days = max(DATE_WINDOW_DAYS, OVERPAY_BACKFILL_WINDOW) if (over_x or 0.0) > AMOUNT_TOL else DATE_WINDOW_DAYS
+
         cand = credits.copy()
         if pd.notna(ref_date):
-            cand = cand[(cand["posting_date"] >= ref_date - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
-                        (cand["posting_date"] <= ref_date + pd.Timedelta(days=DATE_WINDOW_DAYS))]
+            cand = cand[(cand["posting_date"] >= ref_date - pd.Timedelta(days=win_days)) &
+                        (cand["posting_date"] <= ref_date + pd.Timedelta(days=win_days))]
         cand = cand.assign(
             diff_claim=(cand["amount"] - claim_sum).abs(),
-            diff_claim_plus_over=(cand["amount"] - (claim_sum + (over_x or 0.0))).abs()
+            diff_claim_plus_over=(cand["amount"] - (claim_sum + (over_x or 0.0))).abs(),
+            date_delta=(cand["posting_date"] - ref_date).abs().dt.days if pd.notna(ref_date) else 0
         )
 
         chosen = None; match_mode = None
-        for idx, c in cand.sort_values(["diff_claim","posting_date"]).iterrows():
-            if idx in used_credit: continue
-            if abs(c["amount"] - claim_sum) <= AMOUNT_TOL:
-                chosen = (idx, c); match_mode = "claim_sum"; break
-        if not chosen and (over_x or 0.0) > AMOUNT_TOL:
-            for idx, c in cand.sort_values(["diff_claim_plus_over","posting_date"]).iterrows():
-                if idx in used_credit: continue
+
+        # Try claim_sum + overpay FIRST when overpay exists
+        if (over_x or 0.0) > AMOUNT_TOL:
+            for idx, c in cand.sort_values(["diff_claim_plus_over","date_delta","posting_date"]).iterrows():
+                if idx in used_credit: 
+                    continue
                 if abs(c["amount"] - (claim_sum + over_x)) <= AMOUNT_TOL:
                     chosen = (idx, c); match_mode = "claim_sum_plus_overpay"; break
+
+        # Fallback to exact claim_sum
+        if not chosen:
+            for idx, c in cand.sort_values(["diff_claim","date_delta","posting_date"]).iterrows():
+                if idx in used_credit:
+                    continue
+                if abs(c["amount"] - claim_sum) <= AMOUNT_TOL:
+                    chosen = (idx, c); match_mode = "claim_sum"; break
 
         over_debit_date = None; over_debit_desc = None
         if chosen:
             idx, c = chosen; used_credit.add(idx)
             if match_mode == "claim_sum_plus_overpay" and (over_x or 0.0) > AMOUNT_TOL:
                 dwin = debits[(debits["amount"].abs().sub(over_x).abs() <= AMOUNT_TOL)].copy()
+                # Prefer debits near the credit date
                 dnear_credit = dwin[(dwin["posting_date"] >= c["posting_date"] - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
                                     (dwin["posting_date"] <= c["posting_date"] + pd.Timedelta(days=DATE_WINDOW_DAYS))]
                 dnear_credit = dnear_credit.sort_values(["overpay_hint","posting_date"], ascending=[False, True])
@@ -293,6 +303,7 @@ def match_credits_one_row_per_claim(r2d, chase):
                     if didx in used_overpay_debit: continue
                     over_debit_date = d["posting_date"]; over_debit_desc = d["description"]
                     used_overpay_debit.add(didx); break
+                # Fallback near ref date
                 if over_debit_date is None and pd.notna(ref_date):
                     dnear_ref = dwin[(dwin["posting_date"] >= ref_date - pd.Timedelta(days=OVERPAY_BACKFILL_WINDOW)) &
                                      (dwin["posting_date"] <= ref_date + pd.Timedelta(days=OVERPAY_BACKFILL_WINDOW))]
@@ -595,9 +606,8 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
     tagged_sum_by_claim = pd.Series(dtype=float)
     tagged_idx = set()
     if "recon_tag" in chase.columns:
-        # Only credits with truly non-empty tags (no astype(str)!)
-        tag_mask = chase["is_credit"] & pd.Series(chase["recon_tag"]).notna()
-        tagged = chase.loc[tag_mask].copy()
+        nonempty_tag = chase["recon_tag"].notna() & chase["recon_tag"].astype(str).str.strip().ne("")
+        tagged = chase.loc[chase["is_credit"] & nonempty_tag].copy()
 
         # Remove credits already matched by algo or notes
         already_used_credit_idx = set(used_credit_idx or []) | set(newly_used_credit or [])
@@ -609,7 +619,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
             tagged_sum_by_claim = tagged.groupby("recon_tag")["amount"].sum()
             tagged_idx = set(tagged.index)
 
-        # Hide tagged credits from CHASE_Unmatched_Credits
+        # Hide ONLY those tagged rows from CHASE_Unmatched_Credits
         if not credits_unmatched_final.empty and tagged_idx:
             credits_unmatched_final = credits_unmatched_final.loc[
                 ~credits_unmatched_final.index.isin(tagged_idx)
@@ -647,11 +657,11 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
             per_claim_rev["Check (Bank - Book)"] = (per_claim_rev["Bank-based Revenue"] - per_claim_rev["Book Revenue (KEEP)"]).round(2)
         print(f"ReconTagged credits merged for {tagged_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_sum_by_claim.sum()):.2f}")
 
-    # Insert correlation id everywhere it makes sense
+    # Insert correlation id
     for df in (d_match, d_un, c_match, over_adj, note_c, note_d, per_claim_rev, c_un_claims):
         insert_corr(df, corr_map, claim_col="claim_id", pos=1)
 
-    # Combined unmatched
+    # Combined unmatched (no corr id)
     combined = build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims)
 
     # Write
