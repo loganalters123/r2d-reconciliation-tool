@@ -538,7 +538,7 @@ if __name__ == "__main__":
     # Configure page
     st.set_page_config(
         page_title="ClaimAngel Reconciliation",
-        page_icon="assets/claimangel_logo.png",
+        page_icon="assets/favicon.png",
         layout="centered",
         initial_sidebar_state="collapsed"
     )
