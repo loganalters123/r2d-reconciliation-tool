@@ -13,7 +13,10 @@ AMOUNT_TOL = 0.01  # 1 cent
 
 TRANSFER_HINTS = re.compile(r"(?:dwolla|transfer|ach|orig co name|orig id|trn)", re.I)
 OVERPAY_DEBIT_HINTS = re.compile(r"(?:2670|transfer)", re.I)
-OVERPAID_REGEX = re.compile(r"overpaid\s+by\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", re.I)
+OVERPAID_REGEX = re.compile(
+    r"(?:overpaid\s*(?:by)?|overpayment\s*(?:of)?)\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})",
+    re.I
+)
 PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
 DOLLAR_REGEX = re.compile(r"\$?\s*([0-9][0-9,]*\.\d{2})")
 DATE_IN_NOTES = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
