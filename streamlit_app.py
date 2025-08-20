@@ -21,8 +21,22 @@ except ImportError as e:
 def inject_custom_css():
     """Inject custom CSS for modern branding and styling"""
     st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300..900&display=swap');
+         # Download button
+        st.download_button(
+            label="📥 Download Reconciliation Results",
+            data=output_data,
+            file_name=output_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+        
+        # Balance Reconciliation Section
+        st.markdown('</div>', unsafe_allow_html=True)
+        show_balance_reconciliation(output_path)
+        st.markdown('<div class="ca-card">', unsafe_allow_html=True)
+        
+        # Show balloons animation
+        st.balloons()    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300..900&display=swap');
     
     :root {
         --ink: #101721;
@@ -296,8 +310,145 @@ def get_logo_base64():
         return ""
 
 def create_status_pill(text, pill_type="info"):
-    """Create a status pill element"""
+    """Create a styled status pill"""
     return f'<span class="pill pill-{pill_type}">{text}</span>'
+
+def show_balance_reconciliation(output_path):
+    """Show balance reconciliation interface"""
+    st.markdown('<div class="ca-card" style="margin-top: 2rem;">', unsafe_allow_html=True)
+    st.subheader("💰 Balance Reconciliation")
+    st.markdown("Compare your Chase balance against the calculated bank-based revenue.")
+    
+    # Try to read the Bank Revenue Summary from the Excel file
+    bank_revenue_total = 0
+    try:
+        bank_summary_df = pd.read_excel(output_path, sheet_name='Bank_Revenue_Summary')
+        if not bank_summary_df.empty and 'Total_Bank_Based_Revenue' in bank_summary_df.columns:
+            bank_revenue_total = float(bank_summary_df['Total_Bank_Based_Revenue'].iloc[0])
+    except Exception as e:
+        st.warning(f"Could not read Bank Revenue Summary: {e}")
+    
+    # Display the total bank revenue
+    st.markdown(f"""
+    <div style="padding: 1rem; background: var(--sky); border-radius: 12px; border: 1px solid var(--accent-light); margin-bottom: 1rem;">
+        <strong>📊 Total Bank-based Revenue: ${bank_revenue_total:,.2f}</strong>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown("**💳 Chase Balance**")
+        chase_balance = st.number_input(
+            "Enter your Chase balance:",
+            value=0.0,
+            format="%.2f",
+            step=0.01,
+            key="chase_balance"
+        )
+    
+    with col2:
+        st.markdown("**➖ Deductions**")
+        
+        # Initialize session state for deductions
+        if 'deductions' not in st.session_state:
+            st.session_state.deductions = []
+        
+        # Add new deduction
+        new_deduction = st.number_input(
+            "Add deduction:",
+            value=0.0,
+            format="%.2f",
+            step=0.01,
+            key="new_deduction"
+        )
+        
+        col2a, col2b = st.columns([1, 1])
+        with col2a:
+            if st.button("➕ Add", use_container_width=True):
+                if new_deduction != 0:
+                    st.session_state.deductions.append(new_deduction)
+                    st.rerun()
+        
+        with col2b:
+            if st.button("🗑️ Clear All", use_container_width=True):
+                st.session_state.deductions = []
+                st.rerun()
+    
+    # Show current deductions
+    if st.session_state.deductions:
+        st.markdown("**Current Deductions:**")
+        total_deductions = 0
+        for i, deduction in enumerate(st.session_state.deductions):
+            col_ded1, col_ded2 = st.columns([3, 1])
+            with col_ded1:
+                st.write(f"${deduction:,.2f}")
+            with col_ded2:
+                if st.button("❌", key=f"remove_{i}"):
+                    st.session_state.deductions.pop(i)
+                    st.rerun()
+            total_deductions += deduction
+        
+        st.markdown(f"**Total Deductions: ${total_deductions:,.2f}**")
+    else:
+        total_deductions = 0
+        st.info("No deductions added yet")
+    
+    # Calculate the reconciliation
+    if chase_balance > 0:
+        calculated_balance = chase_balance - total_deductions
+        delta = calculated_balance - bank_revenue_total
+        
+        st.markdown("---")
+        st.markdown("**📊 Reconciliation Results:**")
+        
+        # Create results display
+        results_html = f"""
+        <div style="padding: 1.5rem; background: #f8f9fa; border-radius: 12px; margin: 1rem 0;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; text-align: center;">
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Chase Balance</div>
+                    <div style="font-size: 1.2rem; font-weight: 600;">${chase_balance:,.2f}</div>
+                </div>
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Minus Deductions</div>
+                    <div style="font-size: 1.2rem; font-weight: 600;">-${total_deductions:,.2f}</div>
+                </div>
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Net Balance</div>
+                    <div style="font-size: 1.2rem; font-weight: 600;">${calculated_balance:,.2f}</div>
+                </div>
+            </div>
+        </div>
+        """
+        st.markdown(results_html, unsafe_allow_html=True)
+        
+        # Show comparison
+        if abs(delta) < 0.01:  # Within 1 cent
+            st.success(f"✅ **Perfect Match!** Your balance matches the bank revenue exactly.")
+        else:
+            delta_color = "#d4bd3b" if abs(delta) < 100 else "#dc3545"
+            delta_icon = "⚠️" if abs(delta) < 100 else "❌"
+            direction = "higher" if delta > 0 else "lower"
+            
+            st.markdown(f"""
+            <div style="padding: 1rem; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 12px; margin: 1rem 0;">
+                <div style="color: {delta_color}; font-weight: 600;">
+                    {delta_icon} <strong>Delta: ${abs(delta):,.2f}</strong>
+                </div>
+                <div style="color: #856404; margin-top: 0.5rem;">
+                    Your net balance is ${abs(delta):,.2f} {direction} than the bank-based revenue.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Suggestions
+            if delta > 0:
+                st.info("💡 **Suggestion:** You may have additional deductions to account for, or there could be unrecorded transactions.")
+            else:
+                st.info("💡 **Suggestion:** You may have missed some credits, or there could be timing differences in the reconciliation.")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def main():
     """Main application interface"""

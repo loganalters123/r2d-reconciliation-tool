@@ -717,6 +717,16 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
     # Combined unmatched (no corr id, exclude reconciled items by type)
     combined = build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un, reconciled_credit_claims, reconciled_debit_claims)
 
+    # Create Bank Revenue Summary
+    bank_revenue_summary = pd.DataFrame()
+    if not per_claim_rev.empty and "Bank-based Revenue" in per_claim_rev.columns:
+        total_bank_revenue = per_claim_rev["Bank-based Revenue"].fillna(0).sum()
+        bank_revenue_summary = pd.DataFrame([{
+            "Total_Bank_Based_Revenue": round(total_bank_revenue, 2),
+            "Count_of_Claims": len(per_claim_rev),
+            "Generated_Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])
+
     # Write
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
         d_match.to_excel(w, "Debit_Matches", index=False)
@@ -729,6 +739,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
         note_c.to_excel(w, "Note_Matched_Credits", index=False)
         note_d.to_excel(w, "Note_Matched_Debits", index=False)
         per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
+        bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
         combined.to_excel(w, "Unmatched_Combined", index=False)
         summary.to_excel(w, "Summary", index=False)
         pd.DataFrame([{"duplicates_removed_by_ach_id": dup}]).to_excel(w, "Stats", index=False)
