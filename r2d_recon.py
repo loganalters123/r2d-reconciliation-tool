@@ -727,22 +727,27 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
             "Generated_Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         }])
 
-    # Create Balance Analysis Template
-    balance_analysis = pd.DataFrame([
-        {"Category": "Chase_1160_Balance", "Amount": 0.00, "Notes": "Enter your current Chase 1160 account balance"},
-        {"Category": "Exclusion_1", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
-        {"Category": "Exclusion_2", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
-        {"Category": "Exclusion_3", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
-        {"Category": "Exclusion_4", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
-        {"Category": "Additional_Exclusion", "Amount": 0.00, "Notes": "Add more exclusions as needed"},
-        {"Category": "CALCULATION_Net_Balance", "Amount": "=B1-SUM(B2:B6)", "Notes": "Net Balance after exclusions (Chase Balance - Total Exclusions)"},
-        {"Category": "Bank_Revenue_Actual", "Amount": round(total_bank_revenue, 2) if 'total_bank_revenue' in locals() else 0, "Notes": "Actual bank revenue from reconciliation"},
-        {"Category": "Delta_Variance", "Amount": "=B7-B8", "Notes": "Difference between net balance and bank revenue (should be close to 0)"},
-        {"Category": "Transfer_Amount_Final", "Amount": round(total_bank_revenue, 2) if 'total_bank_revenue' in locals() else 0, "Notes": "FINAL: Amount that can be safely transferred out of 1160 account"}
-    ])
+    # Create Balance Analysis Template (data only, formulas added separately)
+    balance_analysis_data = [
+        ["Chase_1160_Balance", 0.00, "Enter your current Chase 1160 account balance"],
+        ["Exclusion_1", 0.00, "Amount to exclude from this reconciliation period"],
+        ["Exclusion_2", 0.00, "Amount to exclude from this reconciliation period"],
+        ["Exclusion_3", 0.00, "Amount to exclude from this reconciliation period"],
+        ["Exclusion_4", 0.00, "Amount to exclude from this reconciliation period"],
+        ["Additional_Exclusion", 0.00, "Add more exclusions as needed"],
+        ["CALCULATION_Net_Balance", None, "Net Balance after exclusions (Chase Balance - Total Exclusions)"],
+        ["Bank_Revenue_Actual", round(total_bank_revenue, 2) if 'total_bank_revenue' in locals() else 0, "Actual bank revenue from reconciliation"],
+        ["Delta_Variance", None, "Difference between net balance and bank revenue (should be close to 0)"],
+        ["Transfer_Amount_Final", round(total_bank_revenue, 2) if 'total_bank_revenue' in locals() else 0, "FINAL: Amount that can be safely transferred out of 1160 account"]
+    ]
 
     # Write
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
+        # Get the workbook and add formats
+        workbook = w.book
+        currency_format = workbook.add_format({'num_format': '$#,##0.00'})
+        header_format = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC'})
+        
         d_match.to_excel(w, "Debit_Matches", index=False)
         d_un.to_excel(w, "Debit_Unmatched", index=False)
         debits_orphans_final.to_excel(w, "CHASE_Unmatched_Debits", index=False)
@@ -754,7 +759,34 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
         note_d.to_excel(w, "Note_Matched_Debits", index=False)
         per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
         bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
-        balance_analysis.to_excel(w, "Balance_Analysis", index=False)
+        
+        # Create Balance Analysis sheet with proper Excel formulas
+        worksheet = workbook.add_worksheet("Balance_Analysis")
+        
+        # Add headers
+        worksheet.write('A1', 'Category', header_format)
+        worksheet.write('B1', 'Amount', header_format)
+        worksheet.write('C1', 'Notes', header_format)
+        
+        # Write data rows
+        for row_idx, (category, amount, notes) in enumerate(balance_analysis_data, start=2):
+            worksheet.write(f'A{row_idx}', category)
+            
+            # Handle formulas vs regular values
+            if category == "CALCULATION_Net_Balance":
+                worksheet.write_formula(f'B{row_idx}', '=B2-SUM(B3:B7)', currency_format)
+            elif category == "Delta_Variance":
+                worksheet.write_formula(f'B{row_idx}', '=B8-B9', currency_format)
+            else:
+                worksheet.write(f'B{row_idx}', amount, currency_format)
+            
+            worksheet.write(f'C{row_idx}', notes)
+        
+        # Auto-size columns
+        worksheet.set_column('A:A', 25)
+        worksheet.set_column('B:B', 15)
+        worksheet.set_column('C:C', 50)
+        
         combined.to_excel(w, "Unmatched_Combined", index=False)
         summary.to_excel(w, "Summary", index=False)
         pd.DataFrame([{"duplicates_removed_by_ach_id": dup}]).to_excel(w, "Stats", index=False)
