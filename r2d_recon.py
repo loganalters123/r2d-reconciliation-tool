@@ -539,8 +539,9 @@ def build_summary(d_match, d_un, d_orph, c_match, note_c, note_d):
         len(d_un), len(d_orph)
     ]})
 
-def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un=None, reconciled_claims=None):
-    reconciled_claims = reconciled_claims or set()
+def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un=None, reconciled_credit_claims=None, reconciled_debit_claims=None):
+    reconciled_credit_claims = reconciled_credit_claims or set()
+    reconciled_debit_claims = reconciled_debit_claims or set()
     
     cu = credits_unmatched_final.copy()
     if not cu.empty:
@@ -558,9 +559,9 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
     d_unmatched = None
     if d_un is not None and not d_un.empty:
         d_unmatched = d_un.copy()
-        # Exclude reconciled claims from R2D unmatched debits
-        if reconciled_claims:
-            d_unmatched = d_unmatched.loc[~d_unmatched["claim_id"].astype(str).isin(reconciled_claims)].copy()
+        # Only exclude R2D unmatched debits if they were specifically matched as debits
+        if reconciled_debit_claims:
+            d_unmatched = d_unmatched.loc[~d_unmatched["claim_id"].astype(str).isin(reconciled_debit_claims)].copy()
         
         if not d_unmatched.empty:
             # Use transfer_initiated as date, amount_transferred as amount
@@ -578,9 +579,9 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
             
     cu_claims = c_un_claims.copy()
     if not cu_claims.empty:
-        # Exclude reconciled claims from unmatched credit claims
-        if reconciled_claims:
-            cu_claims = cu_claims.loc[~cu_claims["claim_id"].astype(str).isin(reconciled_claims)].copy()
+        # Only exclude unmatched credit claims if they were specifically matched as credits
+        if reconciled_credit_claims:
+            cu_claims = cu_claims.loc[~cu_claims["claim_id"].astype(str).isin(reconciled_credit_claims)].copy()
             
         if not cu_claims.empty:
             rename_map = {"ref_date":"date","notes_any":"notes","repayment_sum":"amount","claimant":"claimant","claim_id":"claim_id"}
@@ -693,29 +694,28 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
     for df in (d_match, d_un, c_match, over_adj, note_c, note_d, per_claim_rev, c_un_claims):
         insert_corr(df, corr_map, claim_col="claim_id", pos=1)
 
-    # Collect all reconciled claim IDs to exclude from Unmatched_Combined
-    reconciled_claims = set()
+    # Collect reconciled claim IDs separately for credits and debits
+    reconciled_credit_claims = set()
+    reconciled_debit_claims = set()
     
-    # Add debit matches
-    if not d_match.empty and "claim_id" in d_match.columns:
-        reconciled_claims.update(d_match["claim_id"].dropna().astype(str))
-    
-    # Add credit matches  
+    # Add credit matches and note matched credits
     if not c_match.empty and "claim_id" in c_match.columns:
-        reconciled_claims.update(c_match["claim_id"].dropna().astype(str))
-    
-    # Add note matches
+        reconciled_credit_claims.update(c_match["claim_id"].dropna().astype(str))
     if not note_c.empty and "claim_id" in note_c.columns:
-        reconciled_claims.update(note_c["claim_id"].dropna().astype(str))
-    if not note_d.empty and "claim_id" in note_d.columns:
-        reconciled_claims.update(note_d["claim_id"].dropna().astype(str))
+        reconciled_credit_claims.update(note_c["claim_id"].dropna().astype(str))
     
-    # Add ReconTag matches
+    # Add debit matches and note matched debits  
+    if not d_match.empty and "claim_id" in d_match.columns:
+        reconciled_debit_claims.update(d_match["claim_id"].dropna().astype(str))
+    if not note_d.empty and "claim_id" in note_d.columns:
+        reconciled_debit_claims.update(note_d["claim_id"].dropna().astype(str))
+    
+    # Add ReconTag matches to credit reconciled claims
     if not tagged_sum_by_claim.empty:
-        reconciled_claims.update(tagged_sum_by_claim.index.astype(str))
+        reconciled_credit_claims.update(tagged_sum_by_claim.index.astype(str))
 
-    # Combined unmatched (no corr id, exclude reconciled claims)
-    combined = build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un, reconciled_claims)
+    # Combined unmatched (no corr id, exclude reconciled items by type)
+    combined = build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un, reconciled_credit_claims, reconciled_debit_claims)
 
     # Write
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
