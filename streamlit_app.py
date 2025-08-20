@@ -313,11 +313,120 @@ def create_status_pill(text, pill_type="info"):
     """Create a styled status pill"""
     return f'<span class="pill pill-{pill_type}">{text}</span>'
 
+def show_pre_reconciliation_balance():
+    """Show pre-reconciliation balance verification to determine transfer amount"""
+    st.markdown('<div class="ca-card" style="margin-top: 2rem;">', unsafe_allow_html=True)
+    st.subheader("💰 Pre-Reconciliation Balance Check")
+    st.markdown("**Determine how much to transfer out of 1160 account**")
+    st.markdown("Compare your Chase balance against expected exclusions to predict the bank revenue.")
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown("**💳 Current Chase Balance**")
+        pre_balance = st.number_input(
+            "Enter your Chase 1160 balance:",
+            value=0.0,
+            format="%.2f",
+            step=0.01,
+            key="pre_balance",
+            help="Current balance in your Chase 1160 account"
+        )
+    
+    with col2:
+        st.markdown("**➖ Expected Exclusions**")
+        st.markdown("*Amounts that don't apply to this reconciliation period*")
+        
+        # Initialize session state for pre-reconciliation exclusions
+        if 'pre_exclusions' not in st.session_state:
+            st.session_state.pre_exclusions = []
+        
+        # Add new exclusion
+        new_exclusion = st.number_input(
+            "Add exclusion amount:",
+            value=0.0,
+            format="%.2f",
+            step=0.01,
+            key="new_pre_exclusion",
+            help="Amount to exclude from this reconciliation period"
+        )
+        
+        col2a, col2b = st.columns([1, 1])
+        with col2a:
+            if st.button("➕ Add", use_container_width=True, key="add_pre_exclusion"):
+                if new_exclusion != 0:
+                    st.session_state.pre_exclusions.append(new_exclusion)
+                    st.rerun()
+        
+        with col2b:
+            if st.button("🗑️ Clear All", use_container_width=True, key="clear_pre_exclusions"):
+                st.session_state.pre_exclusions = []
+                st.rerun()
+    
+    # Show current exclusions
+    if st.session_state.pre_exclusions:
+        st.markdown("**Current Exclusions:**")
+        total_exclusions = 0
+        for i, exclusion in enumerate(st.session_state.pre_exclusions):
+            col_excl1, col_excl2 = st.columns([3, 1])
+            with col_excl1:
+                st.write(f"${exclusion:,.2f}")
+            with col_excl2:
+                if st.button("❌", key=f"remove_pre_{i}"):
+                    st.session_state.pre_exclusions.pop(i)
+                    st.rerun()
+            total_exclusions += exclusion
+        
+        st.markdown(f"**Total Exclusions: ${total_exclusions:,.2f}**")
+    else:
+        total_exclusions = 0
+        st.info("No exclusions added yet")
+    
+    # Calculate expected transfer amount
+    if pre_balance > 0:
+        expected_revenue = pre_balance - total_exclusions
+        
+        st.markdown("---")
+        st.markdown("**📊 Expected Transfer Calculation:**")
+        
+        # Create calculation display
+        calc_html = f"""
+        <div style="padding: 1.5rem; background: #f8f9fa; border-radius: 12px; margin: 1rem 0;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; text-align: center;">
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Chase 1160 Balance</div>
+                    <div style="font-size: 1.2rem; font-weight: 600;">${pre_balance:,.2f}</div>
+                </div>
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Minus Exclusions</div>
+                    <div style="font-size: 1.2rem; font-weight: 600;">-${total_exclusions:,.2f}</div>
+                </div>
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Expected Revenue</div>
+                    <div style="font-size: 1.2rem; font-weight: 600; color: var(--accent);">${expected_revenue:,.2f}</div>
+                </div>
+            </div>
+        </div>
+        """
+        st.markdown(calc_html, unsafe_allow_html=True)
+        
+        # Guidance
+        if expected_revenue > 0:
+            st.success(f"💡 **Expected Bank Revenue: ${expected_revenue:,.2f}**")
+            st.info(f"🎯 **Action:** After reconciliation, you should be able to transfer **${expected_revenue:,.2f}** out of the 1160 account if the reconciliation matches perfectly.")
+        else:
+            st.warning("⚠️ **Warning:** Expected revenue is negative or zero. Please check your exclusions.")
+            
+        # Store in session state for comparison after reconciliation
+        st.session_state.expected_transfer_amount = expected_revenue
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
 def show_balance_reconciliation(output_path):
     """Show balance reconciliation interface"""
     st.markdown('<div class="ca-card" style="margin-top: 2rem;">', unsafe_allow_html=True)
-    st.subheader("💰 Balance Reconciliation")
-    st.markdown("Compare your Chase balance against the calculated bank-based revenue.")
+    st.subheader("💰 Post-Reconciliation Balance Verification")
+    st.markdown("Compare your actual results against the pre-reconciliation estimate.")
     
     # Try to read the Bank Revenue Summary from the Excel file
     bank_revenue_total = 0
@@ -328,17 +437,69 @@ def show_balance_reconciliation(output_path):
     except Exception as e:
         st.warning(f"Could not read Bank Revenue Summary: {e}")
     
-    # Display the total bank revenue
+    # Check if we have a pre-reconciliation estimate
+    expected_amount = getattr(st.session_state, 'expected_transfer_amount', None)
+    
+    if expected_amount is not None:
+        # Compare pre-reconciliation estimate with actual result
+        estimate_delta = bank_revenue_total - expected_amount
+        
+        st.markdown("**📊 Pre vs Post Reconciliation Comparison:**")
+        
+        comparison_html = f"""
+        <div style="padding: 1.5rem; background: #f8f9fa; border-radius: 12px; margin: 1rem 0;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; text-align: center;">
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Pre-Reconciliation Estimate</div>
+                    <div style="font-size: 1.2rem; font-weight: 600;">${expected_amount:,.2f}</div>
+                </div>
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Actual Bank Revenue</div>
+                    <div style="font-size: 1.2rem; font-weight: 600; color: var(--accent);">${bank_revenue_total:,.2f}</div>
+                </div>
+                <div>
+                    <div style="color: #6c757d; font-size: 0.9rem; margin-bottom: 0.5rem;">Delta</div>
+                    <div style="font-size: 1.2rem; font-weight: 600; color: {'green' if abs(estimate_delta) < 0.01 else 'orange' if abs(estimate_delta) < 100 else 'red'};">
+                        ${estimate_delta:+,.2f}
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+        st.markdown(comparison_html, unsafe_allow_html=True)
+        
+        if abs(estimate_delta) < 0.01:
+            st.success("🎯 **Perfect Prediction!** Your pre-reconciliation estimate was spot on!")
+            st.success(f"💰 **Transfer Amount: ${bank_revenue_total:,.2f}** - You can confidently transfer this amount out of the 1160 account.")
+        elif abs(estimate_delta) < 100:
+            st.warning(f"⚠️ **Small variance of ${abs(estimate_delta):,.2f}** - Close estimate but review for minor discrepancies.")
+            st.info(f"💰 **Transfer Amount: ${bank_revenue_total:,.2f}** - This is the actual amount you can transfer.")
+        else:
+            st.error(f"❌ **Significant variance of ${abs(estimate_delta):,.2f}** - Review your exclusions or there may be unexpected transactions.")
+            st.info(f"💰 **Transfer Amount: ${bank_revenue_total:,.2f}** - Use this actual amount, but investigate the variance.")
+    else:
+        # Display the total bank revenue
+        st.markdown(f"""
+        <div style="padding: 1rem; background: var(--sky); border-radius: 12px; border: 1px solid var(--accent-light); margin-bottom: 1rem;">
+            <strong>📊 Total Bank-based Revenue: ${bank_revenue_total:,.2f}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        st.info("💡 Use the pre-reconciliation balance check above before running future reconciliations for better predictions!")
+    
+    # Final transfer recommendation
+    st.markdown("---")
     st.markdown(f"""
-    <div style="padding: 1rem; background: var(--sky); border-radius: 12px; border: 1px solid var(--accent-light); margin-bottom: 1rem;">
-        <strong>📊 Total Bank-based Revenue: ${bank_revenue_total:,.2f}</strong>
+    <div style="padding: 1.5rem; background: var(--sky); border-radius: 12px; border: 1px solid var(--accent-light); text-align: center;">
+        <h3 style="color: var(--teal-dark); margin: 0;">🎯 Final Transfer Recommendation</h3>
+        <h2 style="color: var(--accent); margin: 0.5rem 0;">${bank_revenue_total:,.2f}</h2>
+        <p style="margin: 0; color: var(--ink);">This is the amount you can safely transfer out of your 1160 account.</p>
     </div>
     """, unsafe_allow_html=True)
     
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.markdown("**💳 Chase Balance**")
+        st.markdown("**💳 Optional: Manual Balance Verification**")
         chase_balance = st.number_input(
             "Enter your Chase balance:",
             value=0.0,
@@ -522,6 +683,9 @@ def main():
                 )
     
     st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Pre-reconciliation Balance Verification
+    show_pre_reconciliation_balance()
     
     # Action button
     st.markdown('<div style="text-align: center; margin: 2rem 0;">', unsafe_allow_html=True)
