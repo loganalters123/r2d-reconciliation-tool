@@ -21,22 +21,8 @@ except ImportError as e:
 def inject_custom_css():
     """Inject custom CSS for modern branding and styling"""
     st.markdown("""
-         # Download button
-        st.download_button(
-            label="📥 Download Reconciliation Results",
-            data=output_data,
-            file_name=output_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-        
-        # Balance Reconciliation Section
-        st.markdown('</div>', unsafe_allow_html=True)
-        show_balance_reconciliation(output_path)
-        st.markdown('<div class="ca-card">', unsafe_allow_html=True)
-        
-        # Show balloons animation
-        st.balloons()    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300..900&display=swap');
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300..900&display=swap');
     
     :root {
         --ink: #101721;

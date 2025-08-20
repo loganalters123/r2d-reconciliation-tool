@@ -727,6 +727,20 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
             "Generated_Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         }])
 
+    # Create Balance Analysis Template
+    balance_analysis = pd.DataFrame([
+        {"Category": "Chase_1160_Balance", "Amount": 0.00, "Notes": "Enter your current Chase 1160 account balance"},
+        {"Category": "Exclusion_1", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
+        {"Category": "Exclusion_2", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
+        {"Category": "Exclusion_3", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
+        {"Category": "Exclusion_4", "Amount": 0.00, "Notes": "Amount to exclude from this reconciliation period"},
+        {"Category": "Additional_Exclusion", "Amount": 0.00, "Notes": "Add more exclusions as needed"},
+        {"Category": "CALCULATION_Net_Balance", "Amount": "=B1-SUM(B2:B6)", "Notes": "Net Balance after exclusions (Chase Balance - Total Exclusions)"},
+        {"Category": "Bank_Revenue_Actual", "Amount": round(total_bank_revenue, 2) if 'total_bank_revenue' in locals() else 0, "Notes": "Actual bank revenue from reconciliation"},
+        {"Category": "Delta_Variance", "Amount": "=B7-B8", "Notes": "Difference between net balance and bank revenue (should be close to 0)"},
+        {"Category": "Transfer_Amount_Final", "Amount": round(total_bank_revenue, 2) if 'total_bank_revenue' in locals() else 0, "Notes": "FINAL: Amount that can be safely transferred out of 1160 account"}
+    ])
+
     # Write
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
         d_match.to_excel(w, "Debit_Matches", index=False)
@@ -740,6 +754,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
         note_d.to_excel(w, "Note_Matched_Debits", index=False)
         per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
         bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
+        balance_analysis.to_excel(w, "Balance_Analysis", index=False)
         combined.to_excel(w, "Unmatched_Combined", index=False)
         summary.to_excel(w, "Summary", index=False)
         pd.DataFrame([{"duplicates_removed_by_ach_id": dup}]).to_excel(w, "Stats", index=False)
