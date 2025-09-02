@@ -750,7 +750,9 @@ def run_reconciliation(uploaded_file, r2d_sheet, chase_sheet, ignore_debits_befo
                 r2d_sheet=r2d_sheet,
                 chase_sheet=chase_sheet, 
                 out_path=output_path,
-                ignore_debits_before=ignore_debits_before
+                ignore_debits_before=ignore_debits_before,
+                pre_balance=st.session_state.get('pre_balance', None),
+                pre_exclusions=st.session_state.get('pre_exclusions', None)
             )
         
         progress_bar.progress(85)

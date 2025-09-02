@@ -603,7 +603,7 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
 
 # ------------------------- Orchestration -------------------------
 
-def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
+def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, pre_balance=None, pre_exclusions=None):
     # Load
     r2d   = load_r2d(file_path, r2d_sheet)
     chase = load_chase(file_path, chase_sheet)
@@ -760,7 +760,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
         per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
         bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
         
-        # Create Balance Analysis sheet with proper Excel formulas
+    # Create Balance Analysis sheet with proper Excel formulas
         worksheet = workbook.add_worksheet("Balance_Analysis")
         
         # Add headers
@@ -768,6 +768,31 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
         worksheet.write('B1', 'Amount', header_format)
         worksheet.write('C1', 'Notes', header_format)
         
+        # Normalize optional inputs
+        try:
+            pre_balance_val = float(pre_balance) if pre_balance is not None else None
+        except Exception:
+            pre_balance_val = None
+        pre_exclusions_list = None
+        if isinstance(pre_exclusions, (list, tuple)):
+            # force positive values and coerce to float
+            tmp = []
+            for v in pre_exclusions:
+                try:
+                    tmp.append(abs(float(v)))
+                except Exception:
+                    continue
+            pre_exclusions_list = tmp if tmp else None
+
+        # Map categories to exclusion indices
+        excl_index_map = {
+            "Exclusion_1": 0,
+            "Exclusion_2": 1,
+            "Exclusion_3": 2,
+            "Exclusion_4": 3,
+            "Additional_Exclusion": 4,
+        }
+
         # Write data rows
         for row_idx, (category, amount, notes) in enumerate(balance_analysis_data, start=2):
             worksheet.write(f'A{row_idx}', category)
@@ -778,7 +803,17 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None):
             elif category == "Delta_Variance":
                 worksheet.write_formula(f'B{row_idx}', '=B8-B9', currency_format)
             else:
-                worksheet.write(f'B{row_idx}', amount, currency_format)
+                # Override with provided inputs when available
+                if category == "Chase_1160_Balance" and pre_balance_val is not None:
+                    worksheet.write(f'B{row_idx}', pre_balance_val, currency_format)
+                elif category in excl_index_map and pre_exclusions_list is not None:
+                    idx = excl_index_map[category]
+                    if idx < len(pre_exclusions_list):
+                        worksheet.write(f'B{row_idx}', pre_exclusions_list[idx], currency_format)
+                    else:
+                        worksheet.write(f'B{row_idx}', amount, currency_format)
+                else:
+                    worksheet.write(f'B{row_idx}', amount, currency_format)
             
             worksheet.write(f'C{row_idx}', notes)
         
