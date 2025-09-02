@@ -341,7 +341,8 @@ def show_pre_reconciliation_balance():
         with col2a:
             if st.button("➕ Add", use_container_width=True, key="add_pre_exclusion"):
                 if new_exclusion != 0:
-                    st.session_state.pre_exclusions.append(new_exclusion)
+                    # Always treat exclusions as positive amounts to avoid double-negatives
+                    st.session_state.pre_exclusions.append(abs(new_exclusion))
                     st.rerun()
         
         with col2b:
@@ -514,7 +515,8 @@ def show_balance_reconciliation(output_path):
         with col2a:
             if st.button("➕ Add", use_container_width=True):
                 if new_deduction != 0:
-                    st.session_state.deductions.append(new_deduction)
+                    # Always treat deductions as positive amounts to avoid double-negatives
+                    st.session_state.deductions.append(abs(new_deduction))
                     st.rerun()
         
         with col2b:
@@ -798,7 +800,7 @@ def run_reconciliation(uploaded_file, r2d_sheet, chase_sheet, ignore_debits_befo
         
         # Download button
         st.download_button(
-            label="� Download Reconciliation Results",
+            label="⬇️ Download Reconciliation Results",
             data=output_data,
             file_name=output_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
