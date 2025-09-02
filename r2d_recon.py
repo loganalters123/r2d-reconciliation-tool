@@ -539,7 +539,7 @@ def build_summary(d_match, d_un, d_orph, c_match, note_c, note_d):
         len(d_un), len(d_orph)
     ]})
 
-def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un=None, reconciled_credit_claims=None, reconciled_debit_claims=None):
+def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un=None, reconciled_credit_claims=None, reconciled_debit_claims=None, expected_overpay_missing=None):
     reconciled_credit_claims = reconciled_credit_claims or set()
     reconciled_debit_claims = reconciled_debit_claims or set()
     
@@ -598,7 +598,13 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
         else:
             cu_claims = None
             
-    frames = [df for df in [cu, du, d_unmatched, cu_claims] if df is not None and not df.empty]
+    # Add expected overpay debits that couldn't be matched to any Chase debit
+    if expected_overpay_missing is not None and not expected_overpay_missing.empty:
+        # Ensure correct columns and order
+        cols = ["category","claim_id","claimant","date","amount","description","notes"]
+        expected_overpay_missing = expected_overpay_missing[cols]
+
+    frames = [df for df in [cu, du, d_unmatched, cu_claims, expected_overpay_missing] if df is not None and not df.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["category","claim_id","claimant","date","amount","description","notes"])
 
 # ------------------------- Orchestration -------------------------
@@ -715,7 +721,29 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         reconciled_credit_claims.update(tagged_sum_by_claim.index.astype(str))
 
     # Combined unmatched (no corr id, exclude reconciled items by type)
-    combined = build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un, reconciled_credit_claims, reconciled_debit_claims)
+    # Build expected overpay debits that we predicted but couldn't find a matching Chase debit
+    expected_overpay_missing = None
+    if isinstance(c_match, pd.DataFrame) and not c_match.empty and "overpay_amount" in c_match.columns:
+        exp = c_match[(c_match["overpay_amount"].fillna(0) > AMOUNT_TOL) & (c_match["overpay_debit_date"].isna())].copy()
+        if not exp.empty:
+            expected_overpay_missing = exp.rename(columns={
+                "ref_date": "date",
+                "overpay_amount": "amount",
+                "notes": "notes",
+            })
+            # Ensure necessary columns
+            for col in ["claim_id","claimant","date","amount"]:
+                if col not in expected_overpay_missing.columns:
+                    expected_overpay_missing[col] = pd.NA
+            expected_overpay_missing["category"] = "Expected_Overpay_Debit (missing)"
+            expected_overpay_missing["description"] = "Overpayment debit expected but not found in Chase"
+            expected_overpay_missing = expected_overpay_missing[["category","claim_id","claimant","date","amount","description","notes"]]
+
+    combined = build_unmatched_combined(
+        credits_unmatched_final, debits_orphans_final, c_un_claims, d_un,
+        reconciled_credit_claims, reconciled_debit_claims,
+        expected_overpay_missing=expected_overpay_missing
+    )
 
     # Create Bank Revenue Summary
     bank_revenue_summary = pd.DataFrame()
