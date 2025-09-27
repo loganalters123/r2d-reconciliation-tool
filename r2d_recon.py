@@ -176,7 +176,49 @@ def match_debits_relaxed(r2d, chase):
     debits = chase[chase["is_debit"]].copy()
     results, unmatched_idx, used = [], [], set()
 
+    # First pass: exact date matches only (within standard window)
     for i, row in r2d_dedup.iterrows():
+        amt = row.get("amount_transferred")
+        win = row.get("window_date")
+        if amt is None or pd.isna(amt) or pd.isna(win):
+            continue
+
+        amt_rounded = r2(amt)
+        cand = debits[debits["amount"].abs().sub(abs(amt_rounded)).abs() <= AMOUNT_TOL].copy()
+        cand = cand[(cand["posting_date"] >= win - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
+                    (cand["posting_date"] <= win + pd.Timedelta(days=DATE_WINDOW_DAYS))]
+        if cand.empty:
+            continue
+
+        cand = cand.assign(date_delta=(cand["posting_date"]-win).abs().dt.days)
+        cand = cand.sort_values(["has_hint","date_delta"], ascending=[False, True])
+        chosen = None
+        for idx, c in cand.iterrows():
+            if idx not in used:
+                chosen = (idx, c); break
+        if not chosen:
+            continue
+
+        idx, c = chosen; used.add(idx)
+        confidence = 0.5 + (0.3 if c["has_hint"] else 0) + (0.2 if abs((c["posting_date"]-win).days)<=1 else 0)
+        results.append({
+            "ach_id": row.get("ach_id"),
+            "claim_id": row.get("claim_id"),
+            "amount_transferred": amt_rounded,
+            "r2d_date": win,
+            "chase_date": c["posting_date"],
+            "chase_amount": c["amount"],
+            "description": c["description"],
+            "match_type": "amount+window(+hints)",
+            "confidence": r2(min(confidence, 0.99)),
+            "chase_index": idx,
+        })
+
+    # Second pass: wider window for unmatched claims
+    for i, row in r2d_dedup.iterrows():
+        if any(r["claim_id"] == row.get("claim_id") for r in results):  # Already matched
+            continue
+            
         amt = row.get("amount_transferred")
         win = row.get("window_date")
         if amt is None or pd.isna(amt) or pd.isna(win):
@@ -184,8 +226,8 @@ def match_debits_relaxed(r2d, chase):
 
         amt_rounded = r2(amt)
         cand = debits[debits["amount"].abs().sub(abs(amt_rounded)).abs() <= AMOUNT_TOL].copy()
-        cand = cand[(cand["posting_date"] >= win - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
-                    (cand["posting_date"] <= win + pd.Timedelta(days=DATE_WINDOW_DAYS))]
+        cand = cand[(cand["posting_date"] >= win - pd.Timedelta(days=30)) &
+                    (cand["posting_date"] <= win + pd.Timedelta(days=30))]
         if cand.empty:
             unmatched_idx.append(i); continue
 
@@ -208,10 +250,13 @@ def match_debits_relaxed(r2d, chase):
             "chase_date": c["posting_date"],
             "chase_amount": c["amount"],
             "description": c["description"],
-            "match_type": "amount+window(+hints)",
+            "match_type": "amount+extended_window",
             "confidence": r2(min(confidence, 0.99)),
             "chase_index": idx,
         })
+
+    used_debit_idx = [r["chase_index"] for r in results]
+    return pd.DataFrame(results), r2d_dedup.loc[unmatched_idx].copy(), debits.loc[~debits.index.isin(used_debit_idx)].copy(), dup_removed, used_debit_idx
 
     used_debit_idx = [r["chase_index"] for r in results]
     return pd.DataFrame(results), r2d_dedup.loc[unmatched_idx].copy(), debits.loc[~debits.index.isin(used_debit_idx)].copy(), dup_removed, used_debit_idx
