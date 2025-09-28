@@ -134,11 +134,84 @@ def load_chase(path, sheet):
         out["recon_tag"] = pd.NA
     return out
 
+def validate_ach_id_conflicts(r2d: pd.DataFrame):
+    """Detect and report ACH ID conflicts before processing"""
+    with_id = r2d[r2d["ach_id"].astype(str).str.len() > 0].copy()
+
+    if with_id.empty:
+        return []  # No conflicts if no ACH IDs
+
+    conflicts = []
+
+    # Group by ACH ID and check for conflicts
+    for ach_id, group in with_id.groupby("ach_id"):
+        if len(group) > 1:
+            # Check if these are legitimate different claims
+            unique_claim_ids = group["claim_id"].dropna().astype(str).str.strip()
+            unique_claim_ids = unique_claim_ids[unique_claim_ids != ""].unique()
+
+            unique_claimants = group["claimant"].dropna().astype(str).str.strip()
+            unique_claimants = unique_claimants[unique_claimants != ""].unique()
+
+            # Check for true conflicts: different people (not just AFR/Buyout variants)
+            base_claimants = set()
+            for claimant in unique_claimants:
+                # Extract base name (remove AFR, AFR2, Buyout, etc. suffixes)
+                base_name = re.sub(r'\s*\(?(AFR\d*|Buyout.*|BuyoutCA)\)?$', '', claimant).strip()
+                base_claimants.add(base_name)
+
+            # If multiple different base claim IDs or different people share same ACH ID = CONFLICT
+            if len(unique_claim_ids) > 1 or len(base_claimants) > 1:
+                conflict_details = []
+                for _, row in group.iterrows():
+                    conflict_details.append({
+                        "claimant": row["claimant"],
+                        "claim_id": row["claim_id"],
+                        "amount": row["amount_transferred"],
+                        "date": row["window_date"]
+                    })
+
+                conflicts.append({
+                    "ach_id": ach_id,
+                    "num_claims": len(unique_claim_ids) if len(unique_claim_ids) > 1 else len(unique_claimants),
+                    "claims": conflict_details
+                })
+
+    return conflicts
+
 def dedupe_by_ach_id(r2d: pd.DataFrame):
+    """Enhanced deduplication with conflict detection"""
+    # First, check for ACH ID conflicts
+    conflicts = validate_ach_id_conflicts(r2d)
+
+    if conflicts:
+        print("🚨 CRITICAL: ACH ID CONFLICTS DETECTED!")
+        print("The following ACH IDs appear across different claims:")
+        print()
+
+        for conflict in conflicts:
+            print(f"ACH ID: {conflict['ach_id']} ({conflict['num_claims']} different claims)")
+            for claim in conflict['claims']:
+                print(f"  • {claim['claimant']} (Claim: {claim['claim_id']}) - ${claim['amount']:,.2f} on {claim['date']}")
+            print()
+
+        print("❌ STOPPING PROCESSING - Please review source file for data quality issues")
+        print("These conflicts must be resolved before reconciliation can continue.")
+        raise ValueError(f"ACH ID conflicts detected for {len(conflicts)} ACH IDs - source file review required")
+
+    # Proceed with normal deduplication (only true duplicates)
     with_id = r2d[r2d["ach_id"].astype(str).str.len() > 0]
     without_id = r2d[r2d["ach_id"].astype(str).str.len() == 0]
-    kept = with_id.drop_duplicates(subset=["ach_id"], keep="first").copy()
-    return pd.concat([kept, without_id], ignore_index=True), int(len(with_id) - len(kept))
+
+    # Only remove true duplicates (same ACH ID + same claim ID + same claimant)
+    before_count = len(with_id)
+    kept = with_id.drop_duplicates(subset=["ach_id", "claim_id", "claimant"], keep="first").copy()
+    removed_count = before_count - len(kept)
+
+    if removed_count > 0:
+        print(f"📋 Removed {removed_count} true duplicate entries (same ACH ID + same claim + same claimant)")
+
+    return pd.concat([kept, without_id], ignore_index=True), removed_count
 
 # ------------------------- Correlation ID (Parent Legacy ID) -------------------------
 
@@ -932,11 +1005,11 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         currency_format = workbook.add_format({'num_format': '$#,##0.00'})
         header_format = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC'})
         
-        # Write priority sheets first (as requested by user)
+        # Write priority sheets in user-requested order
+        # Sheet 1: Per_Claim_Revenue (primary business view)
         per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
-        combined.to_excel(w, "Unmatched_Combined", index=False)
-        
-        # Balance Analysis sheet with proper Excel formulas
+
+        # Sheet 2: Balance Analysis sheet with proper Excel formulas
         worksheet = workbook.add_worksheet("Balance_Analysis")
         
         # Add headers
@@ -997,7 +1070,10 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         worksheet.set_column('A:A', 25)
         worksheet.set_column('B:B', 15)
         worksheet.set_column('C:C', 50)
-        
+
+        # Sheet 3: Unmatched_Combined (exceptions requiring attention)
+        combined.to_excel(w, "Unmatched_Combined", index=False)
+
         # Write remaining sheets in logical order
         d_match.to_excel(w, "Debit_Matches", index=False)
         d_un.to_excel(w, "Debit_Unmatched", index=False)
