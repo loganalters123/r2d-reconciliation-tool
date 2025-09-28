@@ -18,10 +18,11 @@ OVERPAID_REGEX = re.compile(r"(?:overpaid\s*(?:by)?|overpayment\s*(?:of)?)\s*\$?
 PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
 DOLLAR_REGEX = re.compile(r"\$?\s*([0-9][0-9,]*\.\d{2})")
 DATE_IN_NOTES = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
-CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rem\.?\s*repayment|remaining\s+repayment|req\.?\s*rem\.?|remaining\s*bal|rem\.?\s*bal)", re.I)
+CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\s*rem|received\s+rem|received\s+remaining|rcvd|remaining\s+repayment|repayment\s+received|remaining\s*bal|rem\.?\s*bal|underpaid\s+by)", re.I)
 DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\s*out|2670)", re.I)
 SEND_FUNDER_REGEX = re.compile(r"send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
-RECEIVED_CHECK_REGEX = re.compile(r"(received.*check|rem\.?\s*repayment|remaining\s+repayment|req\.?\s*rem\.?)\D*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+RECEIVED_CHECK_REGEX = re.compile(r"(received.*check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by)\D*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 
 # Shared check detection patterns
 SHARED_CHECK_PATTERNS = re.compile(r"(?:check.*addressed\s+for\s+(\d+)\s+clients?|(\d+)\s+clients?|other\s+client\s+is\s+([^,)]+))", re.I)
@@ -263,9 +264,6 @@ def match_debits_relaxed(r2d, chase):
     used_debit_idx = [r["chase_index"] for r in results]
     return pd.DataFrame(results), r2d_dedup.loc[unmatched_idx].copy(), debits.loc[~debits.index.isin(used_debit_idx)].copy(), dup_removed, used_debit_idx
 
-    used_debit_idx = [r["chase_index"] for r in results]
-    return pd.DataFrame(results), r2d_dedup.loc[unmatched_idx].copy(), debits.loc[~debits.index.isin(used_debit_idx)].copy(), dup_removed, used_debit_idx
-
 # ------------------------- Credit Matching (Parent Claim) -------------------------
 
 def parse_overpaid_amount(notes: str):
@@ -446,19 +444,31 @@ def extract_note_events(text, ref_date):
     dates = [pd.Timestamp(year=year, month=int(m), day=int(d), tz=None) for m, d in DATE_IN_NOTES.findall(text)]
     anchor = dates[-1] if dates else ref_date
 
+    # Collect amounts to ignore (requested remaining amounts)
+    amounts_to_ignore = set()
+    for m in REQUESTED_REMAINING_REGEX.finditer(text):
+        amt = r2(m.group(2).replace(",",""))
+        if amt is not None:
+            amounts_to_ignore.add(amt)
+
     for m in SEND_FUNDER_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
-        if amt is not None:
+        if amt is not None and amt not in amounts_to_ignore:
             events.append(("debit_expected", amt, anchor))
     for m in RECEIVED_CHECK_REGEX.finditer(text):
         amt = r2(m.group(2).replace(",",""))
-        if amt is not None:
+        if amt is not None and amt not in amounts_to_ignore:
             events.append(("credit_expected", amt, anchor))
 
     for m in DOLLAR_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
+        if amt in amounts_to_ignore:
+            continue
         start, end = max(0, m.start()-120), min(len(text), m.end()+120)
         ctx = text[start:end]
+        # Additional check: skip if this dollar amount is in a "requested remaining" context
+        if REQUESTED_REMAINING_REGEX.search(ctx):
+            continue
         is_credit = bool(CREDIT_KEYWORDS.search(ctx))
         is_debit  = bool(DEBIT_KEYWORDS.search(ctx))
         if is_credit and not is_debit:
@@ -817,9 +827,24 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
     # Add ReconTagged credits to Bank Credits (Effective)
     if not tagged_sum_by_claim.empty:
         per_claim_rev["claim_id"] = per_claim_rev["claim_id"].astype(str).str.strip()
+
+        # Only add ReconTag credits for claims that don't already have credit matches
+        claims_with_credit_matches = set()
+        if not c_match.empty:
+            claims_with_credit_matches.update(c_match["claim_id"].dropna().astype(str))
+        if not note_c.empty:
+            claims_with_credit_matches.update(note_c["claim_id"].dropna().astype(str))
+
+        # Filter out ReconTag claims that already have credits
+        filtered_recon_tags = tagged_sum_by_claim.copy()
+        for claim_id in claims_with_credit_matches:
+            if claim_id in filtered_recon_tags.index:
+                print(f"Skipping ReconTag for {claim_id} - already has credit match")
+                filtered_recon_tags = filtered_recon_tags.drop(claim_id)
+
         per_claim_rev["Bank Credits (Effective)"] = (
             per_claim_rev["Bank Credits (Effective)"].fillna(0) +
-            per_claim_rev["claim_id"].map(tagged_sum_by_claim).fillna(0)
+            per_claim_rev["claim_id"].map(filtered_recon_tags).fillna(0)
         ).round(2)
         if "Bank Funder Debits" in per_claim_rev.columns:
             per_claim_rev["Bank-based Revenue"] = (per_claim_rev["Bank Credits (Effective)"] - per_claim_rev["Bank Funder Debits"]).round(2)
