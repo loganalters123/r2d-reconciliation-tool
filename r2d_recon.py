@@ -21,10 +21,10 @@ OVERPAID_REGEX = re.compile(r"(?:overpaid\s*(?:by)?|overpayment\s*(?:of)?)\s*\$?
 PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
 DOLLAR_REGEX = re.compile(r"\$?\s*([0-9][0-9,]*\.\d{2})")
 DATE_IN_NOTES = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
-CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\s*rem|received\s+rem|received\s+remaining|rcvd|remaining\s+repayment|repayment\s+received|remaining\s*bal|rem\.?\s*bal|underpaid\s+by)", re.I)
+CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\s*rem|received\s+rem|received\s+remaining|rcvd|remaining\s+repayment|repayment\s+received|remaining\s*bal|rem\.?\s*bal|underpaid\s+by|overpayment|overpaid)", re.I)
 DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\s*out|2670)", re.I)
 SEND_FUNDER_REGEX = re.compile(r"send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
-RECEIVED_CHECK_REGEX = re.compile(r"(received.*check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by)\D*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+RECEIVED_CHECK_REGEX = re.compile(r"(received.*?check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 
 # Shared check detection patterns
@@ -515,12 +515,22 @@ def extract_note_events(text, ref_date):
     dates = [pd.Timestamp(year=year, month=int(m), day=int(d), tz=None) for m, d in DATE_IN_NOTES.findall(text)]
     anchor = dates[-1] if dates else ref_date
 
-    # Collect amounts to ignore (requested remaining amounts)
+    # Collect amounts to ignore (requested remaining amounts in wrong context)
     amounts_to_ignore = set()
     for m in REQUESTED_REMAINING_REGEX.finditer(text):
         amt = r2(m.group(2).replace(",",""))
         if amt is not None:
-            amounts_to_ignore.add(amt)
+            # Check context around this match to see if it should actually be a credit expectation
+            start, end = max(0, m.start()-50), min(len(text), m.end()+50)
+            context = text[start:end].lower()
+
+            # If "req. rem." follows context indicating money is owed, treat as credit expectation
+            credit_context_keywords = ['underpaid', 'owed', 'owes', 'balance', 'paid prev', 'bracket', 'partial', 'insufficient']
+            if any(keyword in context for keyword in credit_context_keywords):
+                events.append(("credit_expected", amt, anchor))
+            else:
+                # Only ignore if it's truly a "requested remaining" in neutral context
+                amounts_to_ignore.add(amt)
 
     for m in SEND_FUNDER_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
@@ -537,9 +547,6 @@ def extract_note_events(text, ref_date):
             continue
         start, end = max(0, m.start()-120), min(len(text), m.end()+120)
         ctx = text[start:end]
-        # Additional check: skip if this dollar amount is in a "requested remaining" context
-        if REQUESTED_REMAINING_REGEX.search(ctx):
-            continue
         is_credit = bool(CREDIT_KEYWORDS.search(ctx))
         is_debit  = bool(DEBIT_KEYWORDS.search(ctx))
         if is_credit and not is_debit:
