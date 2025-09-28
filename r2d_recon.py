@@ -23,6 +23,11 @@ DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\
 SEND_FUNDER_REGEX = re.compile(r"send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 RECEIVED_CHECK_REGEX = re.compile(r"(received.*check|rem\.?\s*repayment|remaining\s+repayment|req\.?\s*rem\.?)\D*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 
+# Shared check detection patterns
+SHARED_CHECK_PATTERNS = re.compile(r"(?:check.*addressed\s+for\s+(\d+)\s+clients?|(\d+)\s+clients?|other\s+client\s+is\s+([^,)]+))", re.I)
+OTHER_CLIENT_REGEX = re.compile(r"other\s+client\s+is\s+([^,)]+)", re.I)
+CLIENT_COUNT_REGEX = re.compile(r"(?:check.*addressed\s+for\s+|for\s+)?(\d+)\s+clients?", re.I)
+
 def r2(x, nd=2):
     try:
         return round(float(x), nd)
@@ -403,6 +408,36 @@ def match_credits_one_row_per_claim(r2d, chase):
 
 # ------------------------- Notes-driven extra matching -------------------------
 
+def detect_shared_check(text):
+    """
+    Detect if a note describes a shared check and extract shared client information.
+    Returns: tuple (is_shared, client_count, other_client_names)
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False, 1, []
+    
+    other_clients = []
+    client_count = 1
+    
+    # Look for "other client is [Name]" patterns
+    other_client_matches = OTHER_CLIENT_REGEX.findall(text)
+    if other_client_matches:
+        other_clients = [name.strip() for name in other_client_matches]
+        client_count = len(other_clients) + 1  # +1 for the current client
+    
+    # Look for explicit client count mentions
+    count_matches = CLIENT_COUNT_REGEX.findall(text)
+    if count_matches:
+        try:
+            explicit_count = int(count_matches[0])
+            if explicit_count > 1:
+                client_count = max(client_count, explicit_count)
+        except ValueError:
+            pass
+    
+    is_shared = client_count > 1 or len(other_clients) > 0
+    return is_shared, client_count, other_clients
+
 def extract_note_events(text, ref_date):
     events = []
     if not isinstance(text, str) or not text.strip():
@@ -456,6 +491,9 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
         events = extract_note_events(r["notes_any"], r["ref_date"])
         for kind, amount, anchor_date in events:
             if kind == "credit_expected":
+                # Check if this is a shared check
+                is_shared, client_count, other_client_names = detect_shared_check(r["notes_any"])
+                
                 cnd = credits.loc[~credits.index.isin(used_credit_idx + list(newly_used_credit))].copy()
                 if pd.notna(anchor_date):
                     cnd = cnd[(cnd["posting_date"] >= anchor_date - pd.Timedelta(days=NOTE_WINDOW_DAYS)) &
@@ -473,17 +511,65 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
                         cnd = cnd[(cnd["amount"].sub(amount).abs() <= AMOUNT_TOL)]
                         if not cnd.empty:
                             chosen = cnd.sort_values("posting_date").iloc[0]
+                
                 if chosen is not None:
                     newly_used_credit.add(chosen.name)
-                    note_credit_rows.append({
-                        "claim_id": r["claim_id"],
-                        "claimant": r["claimant_display"],
-                        "note_amount": amount,
-                        "matched_credit_date": chosen["posting_date"],
-                        "matched_credit_amount": chosen["amount"],
-                        "matched_credit_desc": chosen["description"],
-                        "source": "notes"
-                    })
+                    
+                    if is_shared and client_count > 1:
+                        # For shared checks, split the amount proportionally
+                        # For now, split equally among clients (can be enhanced later to use repayment amounts)
+                        split_amount = chosen["amount"] / client_count
+                        
+                        # Add entry for current client
+                        note_credit_rows.append({
+                            "claim_id": r["claim_id"],
+                            "claimant": r["claimant_display"],
+                            "note_amount": amount,
+                            "matched_credit_date": chosen["posting_date"],
+                            "matched_credit_amount": split_amount,
+                            "matched_credit_desc": chosen["description"] + f" (shared {client_count} ways)",
+                            "source": "notes_shared"
+                        })
+                        
+                        # Try to find and add entries for other clients mentioned in notes
+                        for other_client in other_client_names:
+                            # Try to find the claim_id for the other client
+                            other_client_clean = other_client.strip()
+                            matching_claims = roll[roll["claimant_display"].str.contains(other_client_clean, case=False, na=False)]
+                            
+                            if not matching_claims.empty:
+                                other_claim = matching_claims.iloc[0]
+                                note_credit_rows.append({
+                                    "claim_id": other_claim["claim_id"],
+                                    "claimant": other_claim["claimant_display"],
+                                    "note_amount": amount,
+                                    "matched_credit_date": chosen["posting_date"],
+                                    "matched_credit_amount": split_amount,
+                                    "matched_credit_desc": chosen["description"] + f" (shared {client_count} ways)",
+                                    "source": "notes_shared"
+                                })
+                            else:
+                                # Create placeholder entry for unknown other client
+                                note_credit_rows.append({
+                                    "claim_id": f"UNKNOWN_{other_client_clean}",
+                                    "claimant": other_client_clean,
+                                    "note_amount": amount,
+                                    "matched_credit_date": chosen["posting_date"],
+                                    "matched_credit_amount": split_amount,
+                                    "matched_credit_desc": chosen["description"] + f" (shared {client_count} ways)",
+                                    "source": "notes_shared_unknown"
+                                })
+                    else:
+                        # Regular (non-shared) credit matching
+                        note_credit_rows.append({
+                            "claim_id": r["claim_id"],
+                            "claimant": r["claimant_display"],
+                            "note_amount": amount,
+                            "matched_credit_date": chosen["posting_date"],
+                            "matched_credit_amount": chosen["amount"],
+                            "matched_credit_desc": chosen["description"],
+                            "source": "notes"
+                        })
 
             elif kind == "debit_expected":
                 dnd = debits.loc[~debits.index.isin(used_debit_idx + list(newly_used_debit))].copy()
@@ -821,19 +907,11 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         currency_format = workbook.add_format({'num_format': '$#,##0.00'})
         header_format = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC'})
         
-        d_match.to_excel(w, "Debit_Matches", index=False)
-        d_un.to_excel(w, "Debit_Unmatched", index=False)
-        debits_orphans_final.to_excel(w, "CHASE_Unmatched_Debits", index=False)
-        c_match.to_excel(w, "Credit_Matches", index=False)
-        c_un_claims.to_excel(w, "Claims_Unmatched_Credits", index=False)
-        credits_unmatched_final.to_excel(w, "CHASE_Unmatched_Credits", index=False)
-        over_adj.to_excel(w, "Overpayment_Adjustments", index=False)
-        note_c.to_excel(w, "Note_Matched_Credits", index=False)
-        note_d.to_excel(w, "Note_Matched_Debits", index=False)
+        # Write priority sheets first (as requested by user)
         per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
-        bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
+        combined.to_excel(w, "Unmatched_Combined", index=False)
         
-    # Create Balance Analysis sheet with proper Excel formulas
+        # Balance Analysis sheet with proper Excel formulas
         worksheet = workbook.add_worksheet("Balance_Analysis")
         
         # Add headers
@@ -895,7 +973,17 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         worksheet.set_column('B:B', 15)
         worksheet.set_column('C:C', 50)
         
-        combined.to_excel(w, "Unmatched_Combined", index=False)
+        # Write remaining sheets in logical order
+        d_match.to_excel(w, "Debit_Matches", index=False)
+        d_un.to_excel(w, "Debit_Unmatched", index=False)
+        debits_orphans_final.to_excel(w, "CHASE_Unmatched_Debits", index=False)
+        c_match.to_excel(w, "Credit_Matches", index=False)
+        c_un_claims.to_excel(w, "Claims_Unmatched_Credits", index=False)
+        credits_unmatched_final.to_excel(w, "CHASE_Unmatched_Credits", index=False)
+        over_adj.to_excel(w, "Overpayment_Adjustments", index=False)
+        note_c.to_excel(w, "Note_Matched_Credits", index=False)
+        note_d.to_excel(w, "Note_Matched_Debits", index=False)
+        bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
         summary.to_excel(w, "Summary", index=False)
         pd.DataFrame([{"duplicates_removed_by_ach_id": dup}]).to_excel(w, "Stats", index=False)
         (excluded_debits_by_date if isinstance(excluded_debits_by_date, pd.DataFrame) else pd.DataFrame()
