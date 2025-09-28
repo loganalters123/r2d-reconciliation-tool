@@ -4,6 +4,9 @@ import re
 from datetime import date
 import pandas as pd
 
+# Global variable to store ACH ID conflicts for Excel output
+ach_id_conflicts = []
+
 # ------------------------- Parameters & Regex -------------------------
 
 DATE_WINDOW_DAYS = 5
@@ -180,24 +183,19 @@ def validate_ach_id_conflicts(r2d: pd.DataFrame):
     return conflicts
 
 def dedupe_by_ach_id(r2d: pd.DataFrame):
-    """Enhanced deduplication with conflict detection"""
+    """Enhanced deduplication with conflict detection and reporting"""
     # First, check for ACH ID conflicts
     conflicts = validate_ach_id_conflicts(r2d)
 
     if conflicts:
-        print("🚨 CRITICAL: ACH ID CONFLICTS DETECTED!")
-        print("The following ACH IDs appear across different claims:")
+        print("⚠️  DATA QUALITY ALERT: ACH ID CONFLICTS DETECTED!")
+        print(f"Found {len(conflicts)} ACH ID conflicts - will be reported in Data_Quality_Issues tab")
+        print("Processing will continue but please review source file for data quality issues")
         print()
 
-        for conflict in conflicts:
-            print(f"ACH ID: {conflict['ach_id']} ({conflict['num_claims']} different claims)")
-            for claim in conflict['claims']:
-                print(f"  • {claim['claimant']} (Claim: {claim['claim_id']}) - ${claim['amount']:,.2f} on {claim['date']}")
-            print()
-
-        print("❌ STOPPING PROCESSING - Please review source file for data quality issues")
-        print("These conflicts must be resolved before reconciliation can continue.")
-        raise ValueError(f"ACH ID conflicts detected for {len(conflicts)} ACH IDs - source file review required")
+    # Store conflicts globally for Excel output
+    global ach_id_conflicts
+    ach_id_conflicts = conflicts
 
     # Proceed with normal deduplication (only true duplicates)
     with_id = r2d[r2d["ach_id"].astype(str).str.len() > 0]
@@ -1073,6 +1071,32 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
 
         # Sheet 3: Unmatched_Combined (exceptions requiring attention)
         combined.to_excel(w, "Unmatched_Combined", index=False)
+
+        # Sheet 4: Data_Quality_Issues (ACH ID conflicts and validation warnings)
+        if ach_id_conflicts:
+            conflict_rows = []
+            for conflict in ach_id_conflicts:
+                for claim in conflict['claims']:
+                    conflict_rows.append({
+                        'ACH_ID': conflict['ach_id'],
+                        'Issue_Type': 'ACH ID Shared Across Different Claims',
+                        'Claimant': claim['claimant'],
+                        'Claim_ID': claim['claim_id'],
+                        'Amount': claim['amount'],
+                        'Date': claim['date'],
+                        'Conflict_Group_Size': len(conflict['claims']),
+                        'Resolution_Required': 'Review source file - same ACH ID used by different people/claims'
+                    })
+
+            conflicts_df = pd.DataFrame(conflict_rows)
+            conflicts_df.to_excel(w, "Data_Quality_Issues", index=False)
+        else:
+            # Create empty sheet with headers if no conflicts
+            empty_conflicts = pd.DataFrame(columns=[
+                'ACH_ID', 'Issue_Type', 'Claimant', 'Claim_ID', 'Amount', 'Date',
+                'Conflict_Group_Size', 'Resolution_Required'
+            ])
+            empty_conflicts.to_excel(w, "Data_Quality_Issues", index=False)
 
         # Write remaining sheets in logical order
         d_match.to_excel(w, "Debit_Matches", index=False)
