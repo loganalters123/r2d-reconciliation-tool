@@ -446,6 +446,23 @@ def match_credits_one_row_per_claim(r2d, chase):
                 if abs(c["amount"] - (repayment_sum + over_x)) <= AMOUNT_TOL:
                     chosen = (idx, c); match_mode = "repayment_sum_plus_overpay"; break
 
+        # Check for name-based FEDWIRE matches (ignore date window for explicit name matches)
+        if not chosen:
+            claimant_name = r["claimant"]
+            # Split name into parts for flexible matching
+            name_parts = [part.strip().upper() for part in claimant_name.replace(",", "").split() if len(part.strip()) > 2]
+
+            fedwire_credits = credits[credits["description"].str.contains("FEDWIRE", na=False, case=False)]
+            for idx, c in fedwire_credits.iterrows():
+                if idx in used_credit:
+                    continue
+                if abs(c["amount"] - repayment_sum) <= AMOUNT_TOL:
+                    desc_upper = c["description"].upper()
+                    # Check if claimant name parts appear in FEDWIRE description
+                    if len(name_parts) >= 2 and all(part in desc_upper for part in name_parts):
+                        chosen = (idx, c); match_mode = "fedwire_name_match"
+                        break
+
         # Fallback to exact repayment_sum
         if not chosen:
             for idx, c in cand.sort_values(["diff_claim","date_delta","posting_date"]).iterrows():
