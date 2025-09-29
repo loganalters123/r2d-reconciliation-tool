@@ -928,19 +928,47 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
     # ReconTag handling:
     tagged_sum_by_claim = pd.Series(dtype=float)
     tagged_idx = set()
+    recon_tag_conflicts = set()  # Track credits that ReconTags claim from main algorithm
+
     if "recon_tag" in chase.columns:
         nonempty_tag = chase["recon_tag"].notna() & chase["recon_tag"].astype(str).str.strip().ne("")
         tagged = chase.loc[chase["is_credit"] & nonempty_tag].copy()
 
-        # Remove credits already matched by algo or notes
+        # ReconTags take PRIORITY over main algorithm matches
+        # Instead of filtering out ReconTags, we'll track conflicts and remove main matches later
         already_used_credit_idx = set(used_credit_idx or []) | set(newly_used_credit or [])
         if not tagged.empty and already_used_credit_idx:
-            tagged = tagged.loc[~tagged.index.isin(already_used_credit_idx)]
+            # Find ReconTag credits that conflict with main algorithm matches
+            recon_tag_conflicts = tagged.index.intersection(already_used_credit_idx)
+            if len(recon_tag_conflicts) > 0:
+                print(f"ReconTag priority: claiming {len(recon_tag_conflicts)} credits from main algorithm matches")
 
         if not tagged.empty:
             tagged["recon_tag"] = tagged["recon_tag"].astype(str).str.strip()
             tagged_sum_by_claim = tagged.groupby("recon_tag")["amount"].sum()
             tagged_idx = set(tagged.index)
+
+        # Remove conflicted main algorithm matches (ReconTag takes priority)
+        if len(recon_tag_conflicts) > 0 and not c_match.empty:
+            conflicted_claims = []
+            for idx, row in c_match.iterrows():
+                chase_credit_date = pd.to_datetime(row["chase_credit_date"]).date()
+                chase_credit_amount = row["chase_credit_amount"]
+
+                # Check if this match used a credit that has a ReconTag
+                for conflict_idx in recon_tag_conflicts:
+                    conflict_row = chase.loc[conflict_idx]
+                    conflict_date = pd.to_datetime(conflict_row["posting_date"]).date()
+                    conflict_amount = conflict_row["amount"]
+
+                    if (chase_credit_date == conflict_date and
+                        abs(chase_credit_amount - conflict_amount) <= 0.01):
+                        conflicted_claims.append(idx)
+                        print(f"Removing {row['claimant']} credit match - ReconTag has priority")
+                        break
+
+            if conflicted_claims:
+                c_match = c_match.drop(conflicted_claims)
 
         # Hide ONLY those tagged rows from CHASE_Unmatched_Credits
         if not credits_unmatched_final.empty and tagged_idx:
@@ -978,7 +1006,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         if not note_c.empty:
             claims_with_credit_matches.update(note_c["claim_id"].dropna().astype(str))
 
-        # Filter out ReconTag claims that already have credits
+        # Filter out ReconTag claims that already have credits (after conflict resolution)
         filtered_recon_tags = tagged_sum_by_claim.copy()
         for claim_id in claims_with_credit_matches:
             if claim_id in filtered_recon_tags.index:
