@@ -865,11 +865,8 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
             cu_claims = cu_claims.loc[~cu_claims["claim_id"].astype(str).isin(reconciled_credit_claims)].copy()
             
         if not cu_claims.empty:
-            # Calculate expected credit as repayment_sum - amount_to_funder_sum (not full repayment_sum)
-            if "repayment_sum" in cu_claims.columns and "amount_to_funder_sum" in cu_claims.columns:
-                cu_claims["expected_credit"] = cu_claims["repayment_sum"] - cu_claims["amount_to_funder_sum"]
-            else:
-                cu_claims["expected_credit"] = cu_claims.get("repayment_sum", 0)
+            # Expected credit should be the full repayment amount that was being searched for
+            cu_claims["expected_credit"] = cu_claims.get("repayment_sum", 0)
 
             rename_map = {"ref_date":"date","notes_any":"notes","expected_credit":"amount","claimant":"claimant","claim_id":"claim_id"}
             if "Repayment Sum" in cu_claims.columns: rename_map["repayment_sum"] = "Repayment Sum"
