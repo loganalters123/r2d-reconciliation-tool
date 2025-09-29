@@ -760,10 +760,9 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
 def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim):
     if not c_match.empty:
         eff = c_match.copy()
-        eff["effective_credit"] = eff.apply(
-            lambda r: r["repayment_sum"] if str(r.get("match_type","")) == "claim_sum_plus_overpay" else r["chase_credit_amount"],
-            axis=1
-        )
+        # Always use chase_credit_amount for effective credit
+        # For overpay cases, chase_credit_amount is already the net amount (repayment - overpay)
+        eff["effective_credit"] = eff["chase_credit_amount"]
         cm_per_claim = eff.groupby("claim_id", dropna=False)["effective_credit"].sum()
     else:
         cm_per_claim = pd.Series(dtype=float)
