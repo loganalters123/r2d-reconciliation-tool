@@ -21,7 +21,7 @@ OVERPAID_REGEX = re.compile(r"(?:overpaid\s*(?:by)?|overpayment\s*(?:of)?)\s*\$?
 PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
 DOLLAR_REGEX = re.compile(r"\$?\s*([0-9][0-9,]*\.\d{2})")
 DATE_IN_NOTES = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
-CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\s*rem|received\s+rem|received\s+remaining|rcvd|remaining\s+repayment|repayment\s+received|remaining\s*bal|rem\.?\s*bal|underpaid\s+by|overpayment|overpaid)", re.I)
+CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\s*rem|received\s+rem|received\s+remaining|rcvd|remaining\s+repayment|repayment\s+received|remaining\s*bal|rem\.?\s*bal|underpaid\s+by)", re.I)
 DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\s*out|2670)", re.I)
 SEND_FUNDER_REGEX = re.compile(r"send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 RECEIVED_CHECK_REGEX = re.compile(r"(received.*?check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
@@ -757,7 +757,7 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
 
 # ------------------------- Revenue & Summary -------------------------
 
-def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim):
+def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, overpay_adj=None):
     if not c_match.empty:
         eff = c_match.copy()
         # Always use chase_credit_amount for effective credit
@@ -769,19 +769,93 @@ def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim):
 
     note_c_per = (note_c.groupby("claim_id", dropna=False)["matched_credit_amount"].sum()
                   if not note_c.empty else pd.Series(dtype=float))
-    dm_per_claim = (d_match.groupby("claim_id", dropna=False)["chase_amount"].apply(lambda s: s.abs().sum())
-                    if not d_match.empty else pd.Series(dtype=float))
-    note_d_per = (note_d.groupby("claim_id", dropna=False)["matched_debit_amount"].apply(lambda s: s.abs().sum())
-                  if not note_d.empty else pd.Series(dtype=float))
+
+    # Separate overpayment debits from funder debits
+    overpay_debits_per = pd.Series(dtype=float)
+    funder_debits_per = pd.Series(dtype=float)
+
+    if not d_match.empty:
+        # Exclude debits that are already processed as overpayment adjustments to avoid double counting
+        if overpay_adj is not None and not overpay_adj.empty:
+            # Get the date and amount combinations from overpayment adjustments
+            overpay_dates_amounts = set(zip(overpay_adj['claim_id'], overpay_adj['matched_debit_date'], overpay_adj['overpay_amount']))
+
+            # Filter out debits that match overpayment adjustments
+            def is_not_overpay_adj(row):
+                return (row['claim_id'], pd.to_datetime(row.get('chase_date', row.get('chase_debit_date', pd.NaT))), abs(row['chase_amount'])) not in overpay_dates_amounts
+
+            d_match_filtered = d_match[d_match.apply(is_not_overpay_adj, axis=1)].copy()
+        else:
+            d_match_filtered = d_match.copy()
+
+        # Use filtered debit matches to avoid double counting overpayment adjustments
+        d_with_repay = d_match_filtered.merge(per_claim[['claim_id', 'Repayment Sum']], on='claim_id', how='left')
+
+        overpay_debits = d_with_repay[
+            (d_with_repay.get("match_type", "").astype(str).str.contains("overpay", case=False, na=False)) |
+            (d_with_repay["description"].str.contains("Online Transfer", case=False, na=False)) |
+            (d_with_repay["chase_amount"].abs() < d_with_repay["Repayment Sum"] * 0.2)  # Less than 20% of repayment
+        ]
+
+        funder_debits = d_with_repay[
+            ~(d_with_repay.get("match_type", "").astype(str).str.contains("overpay", case=False, na=False)) &
+            ~(d_with_repay["description"].str.contains("Online Transfer", case=False, na=False)) &
+            ~(d_with_repay["chase_amount"].abs() < d_with_repay["Repayment Sum"] * 0.2)
+        ]
+
+        overpay_debits_per = (overpay_debits.groupby("claim_id", dropna=False)["chase_amount"].apply(lambda s: s.abs().sum())
+                             if not overpay_debits.empty else pd.Series(dtype=float))
+        funder_debits_per = (funder_debits.groupby("claim_id", dropna=False)["chase_amount"].apply(lambda s: s.abs().sum())
+                            if not funder_debits.empty else pd.Series(dtype=float))
+
+    # Same logic for note debits - separate overpayment from funder debits
+    note_overpay_per = pd.Series(dtype=float)
+    note_funder_per = pd.Series(dtype=float)
+
+    if not note_d.empty:
+        # Check if note debits are overpayment-related based on context
+        if "context" in note_d.columns:
+            context_col = note_d["context"].fillna("").astype(str)
+            note_overpay = note_d[context_col.str.contains("overpay|overpaid", case=False, na=False)]
+            note_funder = note_d[~context_col.str.contains("overpay|overpaid", case=False, na=False)]
+        else:
+            # If no context column, assume all note debits are funder debits for now
+            note_overpay = pd.DataFrame()
+            note_funder = note_d
+
+        note_overpay_per = (note_overpay.groupby("claim_id", dropna=False)["matched_debit_amount"].apply(lambda s: s.abs().sum())
+                           if not note_overpay.empty else pd.Series(dtype=float))
+        note_funder_per = (note_funder.groupby("claim_id", dropna=False)["matched_debit_amount"].apply(lambda s: s.abs().sum())
+                          if not note_funder.empty else pd.Series(dtype=float))
+
+    # Handle overpayment adjustments
+    overpay_adj_per = pd.Series(dtype=float)
+    if overpay_adj is not None and not overpay_adj.empty:
+        overpay_adj_per = overpay_adj.groupby("claim_id", dropna=False)["overpay_amount"].sum()
 
     out = per_claim.copy()
     out["Claimant"] = out.get("claimant", out.get("Claimant", ""))
     out["Claimant"] = out["Claimant"].astype(str).str.replace(PAREN_SUFFIX, "", regex=True)
 
-    out["Bank Credits (Effective)"] = out["claim_id"].map(cm_per_claim).fillna(0).round(2) + \
-                                      out["claim_id"].map(note_c_per).fillna(0).round(2)
-    out["Bank Funder Debits"] = out["claim_id"].map(dm_per_claim).fillna(0).round(2) + \
-                                out["claim_id"].map(note_d_per).fillna(0).round(2)
+    # Bank Credits (Effective) = Credits - Overpayment Debits - Overpayment Adjustments
+    # This handles both patterns:
+    # 1. Overpaid settlements: chase_credit_amount is already net
+    # 2. Check with overpayment deduction: gross credit - overpayment debit = net
+    # 3. Overpayment adjustments: gross credit - overpayment adjustment = net
+    out["Bank Credits (Effective)"] = (
+        out["claim_id"].map(cm_per_claim).fillna(0) +
+        out["claim_id"].map(note_c_per).fillna(0) -
+        out["claim_id"].map(overpay_debits_per).fillna(0) -
+        out["claim_id"].map(note_overpay_per).fillna(0) -
+        out["claim_id"].map(overpay_adj_per).fillna(0)
+    ).round(2)
+
+    # Bank Funder Debits = Only actual funder debits (not overpayments)
+    out["Bank Funder Debits"] = (
+        out["claim_id"].map(funder_debits_per).fillna(0) +
+        out["claim_id"].map(note_funder_per).fillna(0)
+    ).round(2)
+
     out["Bank-based Revenue"] = (out["Bank Credits (Effective)"] - out["Bank Funder Debits"]).round(2)
     out["Book Revenue (KEEP)"] = (out["Repayment Sum"].fillna(0) - out["Amount To Funder Sum"].fillna(0)).round(2)
     out["Check (Bank - Book)"] = (out["Bank-based Revenue"] - out["Book Revenue (KEEP)"]).round(2)
@@ -992,7 +1066,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
 
     # Summary & base per-claim revenue
     summary = build_summary(d_match, d_un, debits_orphans_final, c_match, note_c, note_d)
-    per_claim_rev = compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim)
+    per_claim_rev = compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, over_adj)
 
     # Add ReconTagged credits to Bank Credits (Effective)
     if not tagged_sum_by_claim.empty:
