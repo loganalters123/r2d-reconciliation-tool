@@ -9,7 +9,7 @@ ach_id_conflicts = []
 
 # ------------------------- Parameters & Regex -------------------------
 
-DATE_WINDOW_DAYS = 5
+DATE_WINDOW_DAYS = 10  # Increased from 5 to catch credits that arrive earlier or later
 OVERPAY_BACKFILL_WINDOW = 7
 NOTE_WINDOW_DAYS = 7
 AMOUNT_TOL = 0.01  # 1 cent
@@ -1298,7 +1298,7 @@ if __name__ == "__main__":
     ap.add_argument("--file", required=True)
     ap.add_argument("--r2d-sheet", default="Repayments to Date")
     ap.add_argument("--chase-sheet", default="Chase")
-    ap.add_argument("--out", default="Repayments_to_Date_recon.xlsx")
+    ap.add_argument("--out", default="/Users/Logan/Downloads/Repayments_to_Date_recon-2025-10-20.xlsx")
     ap.add_argument("--ignore-debits-before", default=None, help="YYYY-MM-DD: exclude unmatched CHASE debits before this date and Debit_Unmatched by Transfer Initiated")
     args = ap.parse_args()
     run(args.file, args.r2d_sheet, args.chase_sheet, args.out, args.ignore_debits_before)
