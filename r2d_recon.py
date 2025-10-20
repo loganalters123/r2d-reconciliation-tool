@@ -579,20 +579,28 @@ def extract_note_events(text, ref_date):
 
     # Collect amounts to ignore (requested remaining amounts in wrong context)
     amounts_to_ignore = set()
+
+    # Check if note contains "received rem" pattern - if so, "req rem" amounts are credits received
+    has_received_rem = bool(re.search(r'received\s+rem|rem\.?\s+repayment\s+received|remaining\s+repayment.*?received', text, re.I))
+
     for m in REQUESTED_REMAINING_REGEX.finditer(text):
         amt = r2(m.group(2).replace(",",""))
         if amt is not None:
-            # Check context around this match to see if it should actually be a credit expectation
-            start, end = max(0, m.start()-50), min(len(text), m.end()+50)
-            context = text[start:end].lower()
-
-            # If "req. rem." follows context indicating money is owed, treat as credit expectation
-            credit_context_keywords = ['underpaid', 'owed', 'owes', 'balance', 'paid prev', 'bracket', 'partial', 'insufficient']
-            if any(keyword in context for keyword in credit_context_keywords):
+            # If note has "received rem", then "req rem $X" means they received $X
+            if has_received_rem:
                 events.append(("credit_expected", amt, anchor))
             else:
-                # Only ignore if it's truly a "requested remaining" in neutral context
-                amounts_to_ignore.add(amt)
+                # Check context around this match to see if it should actually be a credit expectation
+                start, end = max(0, m.start()-50), min(len(text), m.end()+50)
+                context = text[start:end].lower()
+
+                # If "req. rem." follows context indicating money is owed, treat as credit expectation
+                credit_context_keywords = ['underpaid', 'owed', 'owes', 'balance', 'paid prev', 'bracket', 'partial', 'insufficient']
+                if any(keyword in context for keyword in credit_context_keywords):
+                    events.append(("credit_expected", amt, anchor))
+                else:
+                    # Only ignore if it's truly a "requested remaining" in neutral context
+                    amounts_to_ignore.add(amt)
 
     for m in SEND_FUNDER_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
