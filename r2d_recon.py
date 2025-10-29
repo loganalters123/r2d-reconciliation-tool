@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
+"""
+Repayments to Date Reconciliation Tool
+
+Reconciles repayment data against bank Chase transactions, matching credits and debits
+through multiple strategies including amount+date matching, note parsing, and ReconTags.
+
+Usage:
+    python3 r2d_recon.py --file <input.xlsx> [--out <output.xlsx>]
+"""
 import argparse
+import logging
+import os
 import re
+import sys
 from datetime import date
+from pathlib import Path
 import pandas as pd
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Global variable to store ACH ID conflicts for Excel output
 ach_id_conflicts = []
@@ -40,11 +60,75 @@ def r2(x, nd=2):
 
 # ------------------------- Loaders & Helpers -------------------------
 
-def colmap(df, wanted_names):
+def validate_file_exists(file_path):
+    """
+    Validate that the input file exists and is readable.
+
+    Args:
+        file_path: Path to the file to validate
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        PermissionError: If file isn't readable
+    """
+    path = Path(file_path)
+    if not path.exists():
+        logger.error(f"File not found: {file_path}")
+        raise FileNotFoundError(f"Input file does not exist: {file_path}")
+    if not path.is_file():
+        logger.error(f"Path is not a file: {file_path}")
+        raise ValueError(f"Path is not a file: {file_path}")
+    if not os.access(file_path, os.R_OK):
+        logger.error(f"File is not readable: {file_path}")
+        raise PermissionError(f"File is not readable: {file_path}")
+    logger.info(f"✓ File validated: {path.name}")
+
+def validate_sheet_exists(file_path, sheet_name):
+    """
+    Validate that a sheet exists in the Excel file.
+
+    Args:
+        file_path: Path to the Excel file
+        sheet_name: Name of the sheet to check
+
+    Raises:
+        ValueError: If sheet doesn't exist
+    """
+    try:
+        xl_file = pd.ExcelFile(file_path)
+        if sheet_name not in xl_file.sheet_names:
+            logger.error(f"Sheet '{sheet_name}' not found in {Path(file_path).name}")
+            logger.info(f"Available sheets: {', '.join(xl_file.sheet_names)}")
+            raise ValueError(f"Sheet '{sheet_name}' not found. Available: {', '.join(xl_file.sheet_names)}")
+        logger.info(f"✓ Sheet found: {sheet_name}")
+    except Exception as e:
+        if "not found" in str(e):
+            raise
+        logger.error(f"Error reading Excel file: {e}")
+        raise ValueError(f"Cannot read Excel file {Path(file_path).name}: {e}")
+
+def colmap(df, wanted_names, sheet_name="", required=None):
+    """
+    Map column names flexibly using aliases.
+
+    Args:
+        df: DataFrame to map columns for
+        wanted_names: Dict of {key: [list of possible column names]}
+        sheet_name: Name of sheet (for error messages)
+        required: List of keys that are required (will raise error if missing)
+
+    Returns:
+        Dict mapping keys to actual column names (or None if not found)
+
+    Raises:
+        ValueError: If required columns are missing
+    """
     renorm = {c: str(c).strip() for c in df.columns}
     df = df.rename(columns=renorm)
     low = {c.lower(): c for c in df.columns}
     out = {}
+    missing_required = []
+
     for key, aliases in wanted_names.items():
         pick = None
         for a in aliases:
@@ -52,6 +136,20 @@ def colmap(df, wanted_names):
                 pick = low[a.lower()]
                 break
         out[key] = pick
+
+        # Check if required column is missing
+        if required and key in required and pick is None:
+            missing_required.append((key, aliases))
+
+    if missing_required:
+        sheet_msg = f" in sheet '{sheet_name}'" if sheet_name else ""
+        error_msg = f"Missing required columns{sheet_msg}:\n"
+        for key, aliases in missing_required:
+            error_msg += f"  - {key}: Expected one of {aliases}\n"
+        error_msg += f"\nAvailable columns: {list(df.columns)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
     return out
 
 def parse_dates(s):
@@ -66,7 +164,23 @@ def normalize_amount(x):
         return None
 
 def load_r2d(path, sheet):
+    """
+    Load and normalize Repayments to Date sheet.
+
+    Args:
+        path: Path to Excel file
+        sheet: Sheet name to load
+
+    Returns:
+        DataFrame with normalized repayment data
+
+    Raises:
+        ValueError: If required columns are missing
+    """
+    logger.info(f"Loading R2D data from sheet: {sheet}")
     df = pd.read_excel(path, sheet_name=sheet)
+    logger.info(f"  Loaded {len(df)} rows")
+
     wanted = {
         "ach_id": ["ACH ID","ACHID","ACH_Id","ach id"],
         "amount_transferred": ["Amount Transferred","Transferred Amount","amount transferred"],
@@ -81,7 +195,10 @@ def load_r2d(path, sheet):
         "notes": ["Repayment Notes","Reconciliation Notes","Notes"],
         "legacy_id": ["Legacy ID","LegacyID","Legacy Id","Legacy","Correlation ID","CorrelationID"],
     }
-    m = colmap(df, wanted)
+
+    # Required columns for processing
+    required = ["claim_id", "claimant"]
+    m = colmap(df, wanted, sheet_name=sheet, required=required)
     out = pd.DataFrame({
         "ach_id": (df[m["ach_id"]].astype(str).str.strip() if m["ach_id"] else ""),
         "amount_transferred": (df[m["amount_transferred"]] if m["amount_transferred"] else None),
@@ -103,7 +220,23 @@ def load_r2d(path, sheet):
     return out
 
 def load_chase(path, sheet):
+    """
+    Load and normalize Chase bank transactions.
+
+    Args:
+        path: Path to Excel file
+        sheet: Sheet name to load
+
+    Returns:
+        DataFrame with normalized Chase transaction data
+
+    Raises:
+        ValueError: If required columns are missing
+    """
+    logger.info(f"Loading Chase data from sheet: {sheet}")
     df = pd.read_excel(path, sheet_name=sheet)
+    logger.info(f"  Loaded {len(df)} rows")
+
     wanted = {
         "posting_date":["Posting Date","Details Posting Date","Post Date"],
         "description":["Description","Details","Memo"],
@@ -111,7 +244,10 @@ def load_chase(path, sheet):
         "type":["Type"],
         "recon_tag":["ReconTag","Recon Tag","Recon_Tag","RECONTAG","recontag"],
     }
-    m = colmap(df, wanted)
+
+    # Required columns for processing
+    required = ["posting_date", "description", "amount"]
+    m = colmap(df, wanted, sheet_name=sheet, required=required)
     out = pd.DataFrame({
         "posting_date": (parse_dates(df[m["posting_date"]]) if m["posting_date"] else pd.NaT),
         "description": (df[m["description"]].astype(str) if m["description"] else ""),
@@ -188,10 +324,9 @@ def dedupe_by_ach_id(r2d: pd.DataFrame):
     conflicts = validate_ach_id_conflicts(r2d)
 
     if conflicts:
-        print("⚠️  DATA QUALITY ALERT: ACH ID CONFLICTS DETECTED!")
-        print(f"Found {len(conflicts)} ACH ID conflicts - will be reported in Data_Quality_Issues tab")
-        print("Processing will continue but please review source file for data quality issues")
-        print()
+        logger.warning("⚠️  DATA QUALITY ALERT: ACH ID CONFLICTS DETECTED!")
+        logger.warning(f"Found {len(conflicts)} ACH ID conflicts - will be reported in Data_Quality_Issues tab")
+        logger.warning("Processing will continue but please review source file for data quality issues")
 
     # Store conflicts globally for Excel output
     global ach_id_conflicts
@@ -207,7 +342,7 @@ def dedupe_by_ach_id(r2d: pd.DataFrame):
     removed_count = before_count - len(kept)
 
     if removed_count > 0:
-        print(f"📋 Removed {removed_count} true duplicate entries (same ACH ID + same claim + same claimant)")
+        logger.info(f"📋 Removed {removed_count} true duplicate entries (same ACH ID + same claim + same claimant)")
 
     return pd.concat([kept, without_id], ignore_index=True), removed_count
 
@@ -316,9 +451,9 @@ def match_debits_relaxed(r2d, chase):
             })
 
             if len(used_debits) > 0 and match["claimant"] == "Nina Brown":
-                print(f"✅ Nina Brown matched with confidence {match['confidence']} (delta: {match['date_delta']} days)")
+                logger.debug(f"✅ Nina Brown matched with confidence {match['confidence']} (delta: {match['date_delta']} days)")
 
-    print(f"📊 Debit matching: {len(results)} matches from {len(potential_matches)} potential pairs")
+    logger.info(f"📊 Debit matching: {len(results)} matches from {len(potential_matches)} potential pairs")
 
     # Second pass: wider window for unmatched claims
     unmatched_idx = []
@@ -973,7 +1108,33 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
 # ------------------------- Orchestration -------------------------
 
 def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, pre_balance=None, pre_exclusions=None):
-    # Load
+    """
+    Main reconciliation orchestration function.
+
+    Args:
+        file_path: Path to input Excel file
+        r2d_sheet: Name of Repayments to Date sheet
+        chase_sheet: Name of Chase transactions sheet
+        out_path: Path for output Excel file
+        ignore_debits_before: Optional date to exclude older debits
+        pre_balance: Unused parameter
+        pre_exclusions: Unused parameter
+
+    Raises:
+        FileNotFoundError: If input file doesn't exist
+        ValueError: If required sheets or columns are missing
+    """
+    logger.info("="*70)
+    logger.info("RECONCILIATION STARTING")
+    logger.info("="*70)
+
+    # Validate input file
+    validate_file_exists(file_path)
+    validate_sheet_exists(file_path, r2d_sheet)
+    validate_sheet_exists(file_path, chase_sheet)
+
+    # Load data
+    logger.info("\n--- Loading Data ---")
     r2d   = load_r2d(file_path, r2d_sheet)
     chase = load_chase(file_path, chase_sheet)
 
@@ -988,7 +1149,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         tagged_credits = chase.loc[chase["is_credit"] & nonempty_tag]
         if not tagged_credits.empty:
             recontag_credit_indices = set(tagged_credits.index)
-            print(f"Pre-filtering {len(recontag_credit_indices)} ReconTag credits from main matching algorithm")
+            logger.info(f"Pre-filtering {len(recontag_credit_indices)} ReconTag credits from main matching algorithm")
 
     # Debits
     d_match, d_un, d_orph, dup, used_debit_idx = match_debits_relaxed(r2d, chase)
@@ -1071,7 +1232,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
             per_claim_rev["Bank-based Revenue"] = (per_claim_rev["Bank Credits (Effective)"] - per_claim_rev["Bank Funder Debits"]).round(2)
         if "Book Revenue (KEEP)" in per_claim_rev.columns:
             per_claim_rev["Check (Bank - Book)"] = (per_claim_rev["Bank-based Revenue"] - per_claim_rev["Book Revenue (KEEP)"]).round(2)
-        print(f"ReconTagged credits merged for {tagged_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_sum_by_claim.sum()):.2f}")
+        logger.info(f"ReconTagged credits merged for {tagged_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_sum_by_claim.sum()):.2f}")
 
     # Process ReconTagged debits (overpayment returns)
     # These should be deducted from Bank Credits (Effective)
@@ -1100,7 +1261,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
             if "Book Revenue (KEEP)" in per_claim_rev.columns:
                 per_claim_rev["Check (Bank - Book)"] = (per_claim_rev["Bank-based Revenue"] - per_claim_rev["Book Revenue (KEEP)"]).round(2)
 
-            print(f"ReconTagged debits (overpayments) processed for {tagged_debit_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_debit_sum_by_claim.sum()):.2f}")
+            logger.info(f"ReconTagged debits (overpayments) processed for {tagged_debit_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_debit_sum_by_claim.sum()):.2f}")
 
         # Hide ReconTagged debits from CHASE_Unmatched_Debits
         if not debits_orphans_final.empty and tagged_debit_idx:
@@ -1301,16 +1462,43 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         (excluded_dun_by_ti if isinstance(excluded_dun_by_ti, pd.DataFrame) else pd.DataFrame()
         ).to_excel(w, "Excluded_Debit_Unmatched", index=False)
 
-    print(f"Wrote {out_path}")
+    logger.info(f"✓ Reconciliation complete. Output written to: {out_path}")
 
 # ------------------------- CLI -------------------------
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--file", required=True)
-    ap.add_argument("--r2d-sheet", default="Repayments to Date")
-    ap.add_argument("--chase-sheet", default="Chase")
-    ap.add_argument("--out", default="/Users/Logan/Downloads/Repayments_to_Date_recon-2025-10-29.xlsx")
-    ap.add_argument("--ignore-debits-before", default=None, help="YYYY-MM-DD: exclude unmatched CHASE debits before this date and Debit_Unmatched by Transfer Initiated")
+    ap = argparse.ArgumentParser(
+        description="Reconcile repayments against Chase bank transactions",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 r2d_recon.py --file data.xlsx
+  python3 r2d_recon.py --file data.xlsx --out output.xlsx --ignore-debits-before 2025-01-01
+        """
+    )
+    ap.add_argument("--file", required=True, help="Path to input Excel file")
+    ap.add_argument("--r2d-sheet", default="Repayments to Date", help="Name of repayments sheet")
+    ap.add_argument("--chase-sheet", default="Chase", help="Name of Chase transactions sheet")
+    ap.add_argument("--out", default="/Users/Logan/Downloads/Repayments_to_Date_recon-2025-10-29.xlsx", help="Output file path")
+    ap.add_argument("--ignore-debits-before", default=None, help="YYYY-MM-DD: exclude unmatched CHASE debits before this date")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
+
     args = ap.parse_args()
-    run(args.file, args.r2d_sheet, args.chase_sheet, args.out, args.ignore_debits_before)
+
+    # Set logging level
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    try:
+        run(args.file, args.r2d_sheet, args.chase_sheet, args.out, args.ignore_debits_before)
+        sys.exit(0)
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        logger.exception("Full traceback:")
+        sys.exit(1)
