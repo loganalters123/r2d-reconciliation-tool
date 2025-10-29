@@ -23,8 +23,8 @@ DOLLAR_REGEX = re.compile(r"\$?\s*([0-9][0-9,]*\.\d{2})")
 DATE_IN_NOTES = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
 CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\s*rem|received\s+rem|received\s+remaining|rcvd|remaining\s+repayment|repayment\s+received|remaining\s*bal|rem\.?\s*bal|underpaid\s+by)", re.I)
 DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\s*out|2670)", re.I)
-SEND_FUNDER_REGEX = re.compile(r"send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
-RECEIVED_CHECK_REGEX = re.compile(r"(received.*?check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+SEND_FUNDER_REGEX = re.compile(r"(?:to\s+)?send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+RECEIVED_CHECK_REGEX = re.compile(r"(received.*?check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by|received\s+for).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 
 # Shared check detection patterns
@@ -801,14 +801,12 @@ def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, 
 
         overpay_debits = d_with_repay[
             (d_with_repay.get("match_type", "").astype(str).str.contains("overpay", case=False, na=False)) |
-            (d_with_repay["description"].str.contains("Online Transfer", case=False, na=False)) |
-            (d_with_repay["chase_amount"].abs() < d_with_repay["Repayment Sum"] * 0.2)  # Less than 20% of repayment
+            (d_with_repay["description"].str.contains("Online Transfer", case=False, na=False))
         ]
 
         funder_debits = d_with_repay[
             ~(d_with_repay.get("match_type", "").astype(str).str.contains("overpay", case=False, na=False)) &
-            ~(d_with_repay["description"].str.contains("Online Transfer", case=False, na=False)) &
-            ~(d_with_repay["chase_amount"].abs() < d_with_repay["Repayment Sum"] * 0.2)
+            ~(d_with_repay["description"].str.contains("Online Transfer", case=False, na=False))
         ]
 
         overpay_debits_per = (overpay_debits.groupby("claim_id", dropna=False)["chase_amount"].apply(lambda s: s.abs().sum())
@@ -982,12 +980,27 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
     # Correlation map
     corr_map = build_correlation_map(r2d)
 
+    # Pre-filter ReconTag credits so they're excluded from main matching algorithm
+    # This allows those credits to be reserved for their ReconTag claims
+    recontag_credit_indices = set()
+    if "recon_tag" in chase.columns:
+        nonempty_tag = chase["recon_tag"].notna() & chase["recon_tag"].astype(str).str.strip().ne("")
+        tagged_credits = chase.loc[chase["is_credit"] & nonempty_tag]
+        if not tagged_credits.empty:
+            recontag_credit_indices = set(tagged_credits.index)
+            print(f"Pre-filtering {len(recontag_credit_indices)} ReconTag credits from main matching algorithm")
+
     # Debits
     d_match, d_un, d_orph, dup, used_debit_idx = match_debits_relaxed(r2d, chase)
 
-    # Credits (+ overpay)
+    # Credits (+ overpay) - pass ReconTag indices to exclude from matching
+    # Create a modified chase dataframe that excludes ReconTag credits
+    chase_for_matching = chase.copy()
+    if recontag_credit_indices:
+        chase_for_matching = chase_for_matching.loc[~chase_for_matching.index.isin(recontag_credit_indices)].copy()
+
     c_match, c_un_claims, c_un_chase_final, per_claim, over_adj, used_credit_idx, used_overpay_debit = \
-        match_credits_one_row_per_claim(r2d, chase)
+        match_credits_one_row_per_claim(r2d, chase_for_matching)
 
     # Remove overpay-linked debits from orphans
     if used_overpay_debit:
@@ -1009,47 +1022,15 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
     # ReconTag handling:
     tagged_sum_by_claim = pd.Series(dtype=float)
     tagged_idx = set()
-    recon_tag_conflicts = set()  # Track credits that ReconTags claim from main algorithm
-
+    # Process ReconTags for Bank Credits
     if "recon_tag" in chase.columns:
         nonempty_tag = chase["recon_tag"].notna() & chase["recon_tag"].astype(str).str.strip().ne("")
         tagged = chase.loc[chase["is_credit"] & nonempty_tag].copy()
-
-        # ReconTags take PRIORITY over main algorithm matches
-        # Instead of filtering out ReconTags, we'll track conflicts and remove main matches later
-        already_used_credit_idx = set(used_credit_idx or []) | set(newly_used_credit or [])
-        if not tagged.empty and already_used_credit_idx:
-            # Find ReconTag credits that conflict with main algorithm matches
-            recon_tag_conflicts = tagged.index.intersection(already_used_credit_idx)
-            if len(recon_tag_conflicts) > 0:
-                print(f"ReconTag priority: claiming {len(recon_tag_conflicts)} credits from main algorithm matches")
 
         if not tagged.empty:
             tagged["recon_tag"] = tagged["recon_tag"].astype(str).str.strip()
             tagged_sum_by_claim = tagged.groupby("recon_tag")["amount"].sum()
             tagged_idx = set(tagged.index)
-
-        # Remove conflicted main algorithm matches (ReconTag takes priority)
-        if len(recon_tag_conflicts) > 0 and not c_match.empty:
-            conflicted_claims = []
-            for idx, row in c_match.iterrows():
-                chase_credit_date = pd.to_datetime(row["chase_credit_date"]).date()
-                chase_credit_amount = row["chase_credit_amount"]
-
-                # Check if this match used a credit that has a ReconTag
-                for conflict_idx in recon_tag_conflicts:
-                    conflict_row = chase.loc[conflict_idx]
-                    conflict_date = pd.to_datetime(conflict_row["posting_date"]).date()
-                    conflict_amount = conflict_row["amount"]
-
-                    if (chase_credit_date == conflict_date and
-                        abs(chase_credit_amount - conflict_amount) <= 0.01):
-                        conflicted_claims.append(idx)
-                        print(f"Removing {row['claimant']} credit match - ReconTag has priority")
-                        break
-
-            if conflicted_claims:
-                c_match = c_match.drop(conflicted_claims)
 
         # Hide ONLY those tagged rows from CHASE_Unmatched_Credits
         if not credits_unmatched_final.empty and tagged_idx:
@@ -1077,32 +1058,55 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
     per_claim_rev = compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, over_adj)
 
     # Add ReconTagged credits to Bank Credits (Effective)
+    # ReconTags ALWAYS take priority and should ALWAYS be added
     if not tagged_sum_by_claim.empty:
         per_claim_rev["claim_id"] = per_claim_rev["claim_id"].astype(str).str.strip()
 
-        # Only add ReconTag credits for claims that don't already have credit matches
-        claims_with_credit_matches = set()
-        if not c_match.empty:
-            claims_with_credit_matches.update(c_match["claim_id"].dropna().astype(str))
-        if not note_c.empty:
-            claims_with_credit_matches.update(note_c["claim_id"].dropna().astype(str))
-
-        # Filter out ReconTag claims that already have credits (after conflict resolution)
-        filtered_recon_tags = tagged_sum_by_claim.copy()
-        for claim_id in claims_with_credit_matches:
-            if claim_id in filtered_recon_tags.index:
-                print(f"Skipping ReconTag for {claim_id} - already has credit match")
-                filtered_recon_tags = filtered_recon_tags.drop(claim_id)
-
+        # ReconTags are always authoritative - add them without filtering
         per_claim_rev["Bank Credits (Effective)"] = (
             per_claim_rev["Bank Credits (Effective)"].fillna(0) +
-            per_claim_rev["claim_id"].map(filtered_recon_tags).fillna(0)
+            per_claim_rev["claim_id"].map(tagged_sum_by_claim).fillna(0)
         ).round(2)
         if "Bank Funder Debits" in per_claim_rev.columns:
             per_claim_rev["Bank-based Revenue"] = (per_claim_rev["Bank Credits (Effective)"] - per_claim_rev["Bank Funder Debits"]).round(2)
         if "Book Revenue (KEEP)" in per_claim_rev.columns:
             per_claim_rev["Check (Bank - Book)"] = (per_claim_rev["Bank-based Revenue"] - per_claim_rev["Book Revenue (KEEP)"]).round(2)
         print(f"ReconTagged credits merged for {tagged_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_sum_by_claim.sum()):.2f}")
+
+    # Process ReconTagged debits (overpayment returns)
+    # These should be deducted from Bank Credits (Effective)
+    tagged_debit_sum_by_claim = pd.Series(dtype=float)
+    tagged_debit_idx = set()
+    if "recon_tag" in chase.columns:
+        nonempty_tag = chase["recon_tag"].notna() & chase["recon_tag"].astype(str).str.strip().ne("")
+        tagged_debits = chase.loc[chase["is_debit"] & nonempty_tag].copy()
+
+        if not tagged_debits.empty:
+            tagged_debits["recon_tag"] = tagged_debits["recon_tag"].astype(str).str.strip()
+            # Sum the absolute values of debits by claim
+            tagged_debit_sum_by_claim = tagged_debits.groupby("recon_tag")["amount"].apply(lambda x: x.abs().sum())
+            tagged_debit_idx = set(tagged_debits.index)
+
+            # Deduct ReconTagged debits from Bank Credits (Effective)
+            per_claim_rev["claim_id"] = per_claim_rev["claim_id"].astype(str).str.strip()
+            per_claim_rev["Bank Credits (Effective)"] = (
+                per_claim_rev["Bank Credits (Effective)"].fillna(0) -
+                per_claim_rev["claim_id"].map(tagged_debit_sum_by_claim).fillna(0)
+            ).round(2)
+
+            # Recalculate revenue
+            if "Bank Funder Debits" in per_claim_rev.columns:
+                per_claim_rev["Bank-based Revenue"] = (per_claim_rev["Bank Credits (Effective)"] - per_claim_rev["Bank Funder Debits"]).round(2)
+            if "Book Revenue (KEEP)" in per_claim_rev.columns:
+                per_claim_rev["Check (Bank - Book)"] = (per_claim_rev["Bank-based Revenue"] - per_claim_rev["Book Revenue (KEEP)"]).round(2)
+
+            print(f"ReconTagged debits (overpayments) processed for {tagged_debit_sum_by_claim.index.nunique()} claim(s), total = {float(tagged_debit_sum_by_claim.sum()):.2f}")
+
+        # Hide ReconTagged debits from CHASE_Unmatched_Debits
+        if not debits_orphans_final.empty and tagged_debit_idx:
+            debits_orphans_final = debits_orphans_final.loc[
+                ~debits_orphans_final.index.isin(tagged_debit_idx)
+            ].copy()
 
     # Insert correlation id
     for df in (d_match, d_un, c_match, over_adj, note_c, note_d, per_claim_rev, c_un_claims):
@@ -1306,7 +1310,7 @@ if __name__ == "__main__":
     ap.add_argument("--file", required=True)
     ap.add_argument("--r2d-sheet", default="Repayments to Date")
     ap.add_argument("--chase-sheet", default="Chase")
-    ap.add_argument("--out", default="/Users/Logan/Downloads/Repayments_to_Date_recon-2025-10-20.xlsx")
+    ap.add_argument("--out", default="/Users/Logan/Downloads/Repayments_to_Date_recon-2025-10-29.xlsx")
     ap.add_argument("--ignore-debits-before", default=None, help="YYYY-MM-DD: exclude unmatched CHASE debits before this date and Debit_Unmatched by Transfer Initiated")
     args = ap.parse_args()
     run(args.file, args.r2d_sheet, args.chase_sheet, args.out, args.ignore_debits_before)
