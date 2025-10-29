@@ -24,15 +24,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variable to store ACH ID conflicts for Excel output
-ach_id_conflicts = []
+# Note: ACH ID conflicts are now passed through function returns instead of globals
 
 # ------------------------- Parameters & Regex -------------------------
 
-DATE_WINDOW_DAYS = 10  # Increased from 5 to catch credits that arrive earlier or later
-OVERPAY_BACKFILL_WINDOW = 7
-NOTE_WINDOW_DAYS = 7
-AMOUNT_TOL = 0.01  # 1 cent
+# Matching windows
+DATE_WINDOW_DAYS = 10  # Days tolerance for matching transaction dates (increased from 5)
+DATE_WINDOW_DAYS_WIDE = 30  # Wider window for second-pass matching
+OVERPAY_BACKFILL_WINDOW = 7  # Days to look back for overpayment debits
+NOTE_WINDOW_DAYS = 7  # Days tolerance for note-based matching
+NOTE_WINDOW_DAYS_EXTENDED = 3  # Additional days for fallback note matching
+
+# Amount matching
+AMOUNT_TOL = 0.01  # Amount matching tolerance in dollars (1 cent)
+
+# Confidence scoring
+MAX_CONFIDENCE = 0.99  # Maximum confidence score cap for matches
+
+# Overpayment detection
+OVERPAY_DESC_PATTERN = "Online Transfer"  # Description pattern for overpayment debits
 
 TRANSFER_HINTS = re.compile(r"(?:dwolla|transfer|ach|orig co name|orig id|trn)", re.I)
 OVERPAY_DEBIT_HINTS = re.compile(r"(?:2670|transfer)", re.I)
@@ -319,7 +329,18 @@ def validate_ach_id_conflicts(r2d: pd.DataFrame):
     return conflicts
 
 def dedupe_by_ach_id(r2d: pd.DataFrame):
-    """Enhanced deduplication with conflict detection and reporting"""
+    """
+    Enhanced deduplication with conflict detection and reporting.
+
+    Args:
+        r2d: DataFrame with repayment data
+
+    Returns:
+        tuple: (deduplicated_df, removed_count, conflicts)
+            - deduplicated_df: DataFrame with duplicates removed
+            - removed_count: Number of duplicate rows removed
+            - conflicts: List of ACH ID conflicts for reporting
+    """
     # First, check for ACH ID conflicts
     conflicts = validate_ach_id_conflicts(r2d)
 
@@ -327,10 +348,6 @@ def dedupe_by_ach_id(r2d: pd.DataFrame):
         logger.warning("⚠️  DATA QUALITY ALERT: ACH ID CONFLICTS DETECTED!")
         logger.warning(f"Found {len(conflicts)} ACH ID conflicts - will be reported in Data_Quality_Issues tab")
         logger.warning("Processing will continue but please review source file for data quality issues")
-
-    # Store conflicts globally for Excel output
-    global ach_id_conflicts
-    ach_id_conflicts = conflicts
 
     # Proceed with normal deduplication (only true duplicates)
     with_id = r2d[r2d["ach_id"].astype(str).str.len() > 0]
@@ -344,7 +361,7 @@ def dedupe_by_ach_id(r2d: pd.DataFrame):
     if removed_count > 0:
         logger.info(f"📋 Removed {removed_count} true duplicate entries (same ACH ID + same claim + same claimant)")
 
-    return pd.concat([kept, without_id], ignore_index=True), removed_count
+    return pd.concat([kept, without_id], ignore_index=True), removed_count, conflicts
 
 # ------------------------- Correlation ID (Parent Legacy ID) -------------------------
 
@@ -384,7 +401,7 @@ def insert_corr(df, corr_map, claim_col="claim_id", pos=1):
 # ------------------------- Debit Matching -------------------------
 
 def match_debits_relaxed(r2d, chase):
-    r2d_dedup, dup_removed = dedupe_by_ach_id(r2d)
+    r2d_dedup, dup_removed, ach_conflicts = dedupe_by_ach_id(r2d)
     debits = chase[chase["is_debit"]].copy()
 
     # Global optimization: collect all possible claim-debit pairs, then assign by best match
@@ -418,7 +435,7 @@ def match_debits_relaxed(r2d, chase):
                 "description": c["description"],
                 "date_delta": date_delta,
                 "has_hint": c["has_hint"],
-                "confidence": r2(min(confidence, 0.99)),
+                "confidence": r2(min(confidence, MAX_CONFIDENCE)),
                 "match_type": "amount+window(+hints)"
             })
 
@@ -468,8 +485,8 @@ def match_debits_relaxed(r2d, chase):
 
         amt_rounded = r2(amt)
         cand = debits[debits["amount"].abs().sub(abs(amt_rounded)).abs() <= AMOUNT_TOL].copy()
-        cand = cand[(cand["posting_date"] >= win - pd.Timedelta(days=30)) &
-                    (cand["posting_date"] <= win + pd.Timedelta(days=30))]
+        cand = cand[(cand["posting_date"] >= win - pd.Timedelta(days=DATE_WINDOW_DAYS_WIDE)) &
+                    (cand["posting_date"] <= win + pd.Timedelta(days=DATE_WINDOW_DAYS_WIDE))]
         if cand.empty:
             unmatched_idx.append(i); continue
 
@@ -493,30 +510,25 @@ def match_debits_relaxed(r2d, chase):
             "chase_amount": c["amount"],
             "description": c["description"],
             "match_type": "amount+extended_window",
-            "confidence": r2(min(confidence, 0.99)),
+            "confidence": r2(min(confidence, MAX_CONFIDENCE)),
             "chase_index": idx,
         })
 
     used_debit_idx = [r["chase_index"] for r in results]
-    return pd.DataFrame(results), r2d_dedup.loc[unmatched_idx].copy(), debits.loc[~debits.index.isin(used_debit_idx)].copy(), dup_removed, used_debit_idx
+    return pd.DataFrame(results), r2d_dedup.loc[unmatched_idx].copy(), debits.loc[~debits.index.isin(used_debit_idx)].copy(), dup_removed, used_debit_idx, ach_conflicts
 
 # ------------------------- Credit Matching (Parent Claim) -------------------------
 
-def parse_overpaid_amount(notes: str):
-    if not isinstance(notes, str) or not notes.strip():
-        return None
-    m = OVERPAID_REGEX.search(notes)
-    if not m:
-        return None
-    try:
-        return r2(str(m.group(1)).replace(",", ""))
-    except Exception:
-        return None
+def _prepare_credit_matching_data(r2d):
+    """
+    Prepare and aggregate repayment data for credit matching.
 
-def match_credits_one_row_per_claim(r2d, chase):
-    credits = chase[chase["is_credit"]].copy()
-    debits = chase[chase["is_debit"]].copy()
+    Args:
+        r2d: DataFrame with repayment data
 
+    Returns:
+        tuple: (rolled_up_data, parent_claims)
+    """
     tmp = r2d.copy()
     tmp["repayment_amount"] = pd.to_numeric(tmp["repayment_amount"], errors="coerce")
     tmp["amount_to_funder"] = pd.to_numeric(tmp["amount_to_funder"], errors="coerce")
@@ -532,11 +544,22 @@ def match_credits_one_row_per_claim(r2d, chase):
     ).reset_index()
     roll = roll.merge(parents[["claim_id","claimant","deal_type","contract_date"]], on="claim_id", how="left")
 
-    results, used_credit, used_overpay_debit, unmatched_claims = [], set(), set(), []
+    return roll, parents
 
+
+def _setup_priority_sorting(roll):
+    """
+    Add priority columns for claims with identical amounts.
+
+    Args:
+        roll: Rolled-up claims data
+
+    Returns:
+        DataFrame with priority columns and sorted
+    """
     # Priority allocation for identical repayment amounts
     # Define priority order for claims with amount $2312.93
-    PRIORITY_2312_93 = ['Nina Brown', 'Jamie Bagwell', 'Levi Hoerner', 'Evelyn Gaines', 'Raymundo Ramirez Villanueva']
+    PRIORITY_2312_93 = ['Nina Brown', 'Jamie Bagwell', 'Levi Hoerner', 'Evelyn Gaines', 'Raymundo Ramirez Villanuena']
 
     # Add priority columns for sorting
     roll['is_priority_2312'] = (roll['repayment_sum'] - 2312.93).abs() <= 0.01
@@ -545,22 +568,138 @@ def match_credits_one_row_per_claim(r2d, chase):
         else 999, axis=1)
 
     # Sort: priority 2312.93 claims first by priority order, then all others
-    roll_sorted = roll.sort_values(['is_priority_2312', 'priority_index'], ascending=[False, True]).reset_index(drop=True)
+    return roll.sort_values(['is_priority_2312', 'priority_index'], ascending=[False, True]).reset_index(drop=True)
+
+
+def _find_overpay_debit(debits, over_x, credit_date, ref_date, used_overpay_debit):
+    """
+    Find matching overpayment debit for a credit match.
+
+    Args:
+        debits: DataFrame of debit transactions
+        over_x: Overpayment amount to match
+        credit_date: Date of the credit transaction
+        ref_date: Reference date from claim
+        used_overpay_debit: Set of already-used debit indices
+
+    Returns:
+        tuple: (debit_date, debit_description) or (None, None) if not found
+    """
+    dwin = debits[(debits["amount"].abs().sub(over_x).abs() <= AMOUNT_TOL)].copy()
+
+    # Prefer debits near the credit date
+    dnear_credit = dwin[(dwin["posting_date"] >= credit_date - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
+                        (dwin["posting_date"] <= credit_date + pd.Timedelta(days=DATE_WINDOW_DAYS))]
+    dnear_credit = dnear_credit.sort_values(["overpay_hint","posting_date"], ascending=[False, True])
+
+    for didx, d in dnear_credit.iterrows():
+        if didx not in used_overpay_debit:
+            used_overpay_debit.add(didx)
+            return d["posting_date"], d["description"]
+
+    # Fallback near ref date
+    if pd.notna(ref_date):
+        dnear_ref = dwin[(dwin["posting_date"] >= ref_date - pd.Timedelta(days=OVERPAY_BACKFILL_WINDOW)) &
+                         (dwin["posting_date"] <= ref_date + pd.Timedelta(days=OVERPAY_BACKFILL_WINDOW))]
+        dnear_ref = dnear_ref.sort_values(["overpay_hint","posting_date"], ascending=[False, True])
+
+        for didx, d in dnear_ref.iterrows():
+            if didx not in used_overpay_debit:
+                used_overpay_debit.add(didx)
+                return d["posting_date"], d["description"]
+
+    return None, None
+
+
+def _try_match_repayment_plus_overpay(cand, repayment_sum, over_x, used_credit):
+    """Try to match credit for repayment + overpayment amount."""
+    if (over_x or 0.0) <= AMOUNT_TOL:
+        return None, None
+
+    for idx, c in cand.sort_values(["diff_claim_plus_over","date_delta","posting_date"]).iterrows():
+        if idx not in used_credit and abs(c["amount"] - (repayment_sum + over_x)) <= AMOUNT_TOL:
+            return idx, c
+    return None, None
+
+
+def _try_match_fedwire_by_name(credits, claimant_name, repayment_sum, used_credit):
+    """Try to match FEDWIRE credits by claimant name."""
+    name_parts = [part.strip().upper() for part in claimant_name.replace(",", "").split() if len(part.strip()) > 2]
+
+    if len(name_parts) < 2:
+        return None, None
+
+    fedwire_credits = credits[credits["description"].str.contains("FEDWIRE", na=False, case=False)]
+    for idx, c in fedwire_credits.iterrows():
+        if idx not in used_credit and abs(c["amount"] - repayment_sum) <= AMOUNT_TOL:
+            desc_upper = c["description"].upper()
+            if all(part in desc_upper for part in name_parts):
+                return idx, c
+    return None, None
+
+
+def _try_match_exact_repayment(cand, repayment_sum, used_credit):
+    """Try to match credit for exact repayment amount."""
+    for idx, c in cand.sort_values(["diff_claim","date_delta","posting_date"]).iterrows():
+        if idx not in used_credit and abs(c["amount"] - repayment_sum) <= AMOUNT_TOL:
+            return idx, c
+    return None, None
+
+
+def parse_overpaid_amount(notes: str):
+    if not isinstance(notes, str) or not notes.strip():
+        return None
+    m = OVERPAID_REGEX.search(notes)
+    if not m:
+        return None
+    try:
+        return r2(str(m.group(1)).replace(",", ""))
+    except Exception:
+        return None
+
+def match_credits_one_row_per_claim(r2d, chase):
+    """
+    Match credits to claims using multiple strategies.
+
+    This function aggregates repayments by claim, then attempts to match each claim
+    to credit transactions using: repayment+overpay amount, FEDWIRE name matching,
+    or exact repayment amount.
+
+    Args:
+        r2d: DataFrame with repayment data
+        chase: DataFrame with Chase transactions
+
+    Returns:
+        tuple: (credit_matches, unmatched_claims, unmatched_credits, per_claim_revenue,
+                overpayment_adjustments, used_credit_indices, used_overpay_debit_indices)
+    """
+    credits = chase[chase["is_credit"]].copy()
+    debits = chase[chase["is_debit"]].copy()
+
+    # Prepare and aggregate data
+    roll, parents = _prepare_credit_matching_data(r2d)
+
+    # Setup priority sorting for claims with identical amounts
+    roll_sorted = _setup_priority_sorting(roll)
+
+    # Match credits to claims
+    results, used_credit, used_overpay_debit, unmatched_claims = [], set(), set(), []
 
     for _, r in roll_sorted.iterrows():
         claim_id = r["claim_id"]
         repayment_sum = r2(r.get("repayment_sum") or 0.0)
-        amount_to_funder_sum = r2(r.get("amount_to_funder_sum") or 0.0)
 
         if not repayment_sum or repayment_sum <= 0:
-            unmatched_claims.append(claim_id); continue
+            unmatched_claims.append(claim_id)
+            continue
 
         ref_date = r["ref_date"]
         over_x = r2(r.get("overpaid_sum") or 0.0) if pd.notna(r.get("overpaid_sum")) else 0.0
 
-        # Wider window when we have an overpay (checks lag more)
+        # Wider window when we have an overpay
         win_days = max(DATE_WINDOW_DAYS, OVERPAY_BACKFILL_WINDOW) if (over_x or 0.0) > AMOUNT_TOL else DATE_WINDOW_DAYS
 
+        # Filter credits by date window and calculate differences
         cand = credits.copy()
         if pd.notna(ref_date):
             cand = cand[(cand["posting_date"] >= ref_date - pd.Timedelta(days=win_days)) &
@@ -571,63 +710,27 @@ def match_credits_one_row_per_claim(r2d, chase):
             date_delta=(cand["posting_date"] - ref_date).abs().dt.days if pd.notna(ref_date) else 0
         )
 
-        chosen = None; match_mode = None
+        # Try multiple matching strategies in priority order
+        chosen_idx, chosen_credit = _try_match_repayment_plus_overpay(cand, repayment_sum, over_x, used_credit)
+        match_mode = "repayment_sum_plus_overpay" if chosen_idx else None
 
-        # Try repayment_sum + overpay FIRST when overpay exists
-        if (over_x or 0.0) > AMOUNT_TOL:
-            for idx, c in cand.sort_values(["diff_claim_plus_over","date_delta","posting_date"]).iterrows():
-                if idx in used_credit:
-                    continue
-                if abs(c["amount"] - (repayment_sum + over_x)) <= AMOUNT_TOL:
-                    chosen = (idx, c); match_mode = "repayment_sum_plus_overpay"; break
+        if not chosen_idx:
+            chosen_idx, chosen_credit = _try_match_fedwire_by_name(credits, r["claimant"], repayment_sum, used_credit)
+            match_mode = "fedwire_name_match" if chosen_idx else None
 
-        # Check for name-based FEDWIRE matches (ignore date window for explicit name matches)
-        if not chosen:
-            claimant_name = r["claimant"]
-            # Split name into parts for flexible matching
-            name_parts = [part.strip().upper() for part in claimant_name.replace(",", "").split() if len(part.strip()) > 2]
+        if not chosen_idx:
+            chosen_idx, chosen_credit = _try_match_exact_repayment(cand, repayment_sum, used_credit)
+            match_mode = "repayment_sum" if chosen_idx else None
 
-            fedwire_credits = credits[credits["description"].str.contains("FEDWIRE", na=False, case=False)]
-            for idx, c in fedwire_credits.iterrows():
-                if idx in used_credit:
-                    continue
-                if abs(c["amount"] - repayment_sum) <= AMOUNT_TOL:
-                    desc_upper = c["description"].upper()
-                    # Check if claimant name parts appear in FEDWIRE description
-                    if len(name_parts) >= 2 and all(part in desc_upper for part in name_parts):
-                        chosen = (idx, c); match_mode = "fedwire_name_match"
-                        break
+        # Process match and find overpayment debit if applicable
+        if chosen_idx:
+            used_credit.add(chosen_idx)
+            over_debit_date, over_debit_desc = None, None
 
-        # Fallback to exact repayment_sum
-        if not chosen:
-            for idx, c in cand.sort_values(["diff_claim","date_delta","posting_date"]).iterrows():
-                if idx in used_credit:
-                    continue
-                if abs(c["amount"] - repayment_sum) <= AMOUNT_TOL:
-                    chosen = (idx, c); match_mode = "repayment_sum"; break
-
-        over_debit_date = None; over_debit_desc = None
-        if chosen:
-            idx, c = chosen; used_credit.add(idx)
             if match_mode == "repayment_sum_plus_overpay" and (over_x or 0.0) > AMOUNT_TOL:
-                dwin = debits[(debits["amount"].abs().sub(over_x).abs() <= AMOUNT_TOL)].copy()
-                # Prefer debits near the credit date
-                dnear_credit = dwin[(dwin["posting_date"] >= c["posting_date"] - pd.Timedelta(days=DATE_WINDOW_DAYS)) &
-                                    (dwin["posting_date"] <= c["posting_date"] + pd.Timedelta(days=DATE_WINDOW_DAYS))]
-                dnear_credit = dnear_credit.sort_values(["overpay_hint","posting_date"], ascending=[False, True])
-                for didx, d in dnear_credit.iterrows():
-                    if didx in used_overpay_debit: continue
-                    over_debit_date = d["posting_date"]; over_debit_desc = d["description"]
-                    used_overpay_debit.add(didx); break
-                # Fallback near ref date
-                if over_debit_date is None and pd.notna(ref_date):
-                    dnear_ref = dwin[(dwin["posting_date"] >= ref_date - pd.Timedelta(days=OVERPAY_BACKFILL_WINDOW)) &
-                                     (dwin["posting_date"] <= ref_date + pd.Timedelta(days=OVERPAY_BACKFILL_WINDOW))]
-                    dnear_ref = dnear_ref.sort_values(["overpay_hint","posting_date"], ascending=[False, True])
-                    for didx, d in dnear_ref.iterrows():
-                        if didx in used_overpay_debit: continue
-                        over_debit_date = d["posting_date"]; over_debit_desc = d["description"]
-                        used_overpay_debit.add(didx); break
+                over_debit_date, over_debit_desc = _find_overpay_debit(
+                    debits, over_x, chosen_credit["posting_date"], ref_date, used_overpay_debit
+                )
 
             results.append({
                 "claim_id": claim_id,
@@ -638,8 +741,8 @@ def match_credits_one_row_per_claim(r2d, chase):
                 "amount_to_funder_sum": r.get("amount_to_funder_sum"),
                 "ref_date": ref_date,
                 "match_type": match_mode,
-                "chase_credit_date": c["posting_date"],
-                "chase_credit_amount": c["amount"],
+                "chase_credit_date": chosen_credit["posting_date"],
+                "chase_credit_amount": chosen_credit["amount"],
                 "overpay_amount": (over_x or 0.0) if match_mode == "repayment_sum_plus_overpay" else 0.0,
                 "overpay_debit_date": over_debit_date,
                 "overpay_debit_desc": over_debit_desc,
@@ -648,6 +751,7 @@ def match_credits_one_row_per_claim(r2d, chase):
         else:
             unmatched_claims.append(claim_id)
 
+    # Build output dataframes
     credit_matches = pd.DataFrame(results)
     unmatched_df = roll[roll["claim_id"].isin(unmatched_claims)][[
         "claim_id","claimant","deal_type","contract_date","repayment_sum","amount_to_funder_sum","ref_date","overpaid_sum","notes_any"
@@ -799,8 +903,8 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
                     rd = r["ref_date"]
                     if pd.notna(rd):
                         cnd = credits.loc[~credits.index.isin(used_credit_idx + list(newly_used_credit))].copy()
-                        cnd = cnd[(cnd["posting_date"] >= rd - pd.Timedelta(days=NOTE_WINDOW_DAYS+3)) &
-                                  (cnd["posting_date"] <= rd + pd.Timedelta(days=NOTE_WINDOW_DAYS+3))]
+                        cnd = cnd[(cnd["posting_date"] >= rd - pd.Timedelta(days=NOTE_WINDOW_DAYS+NOTE_WINDOW_DAYS_EXTENDED)) &
+                                  (cnd["posting_date"] <= rd + pd.Timedelta(days=NOTE_WINDOW_DAYS+NOTE_WINDOW_DAYS_EXTENDED))]
                         cnd = cnd[(cnd["amount"].sub(amount).abs() <= AMOUNT_TOL)]
                         if not cnd.empty:
                             chosen = cnd.sort_values("posting_date").iloc[0]
@@ -877,8 +981,8 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
                     rd = r["ref_date"]
                     if pd.notna(rd):
                         dnd = debits.loc[~debits.index.isin(used_debit_idx + list(newly_used_debit))].copy()
-                        dnd = dnd[(dnd["posting_date"] >= rd - pd.Timedelta(days=NOTE_WINDOW_DAYS+3)) &
-                                  (dnd["posting_date"] <= rd + pd.Timedelta(days=NOTE_WINDOW_DAYS+3))]
+                        dnd = dnd[(dnd["posting_date"] >= rd - pd.Timedelta(days=NOTE_WINDOW_DAYS+NOTE_WINDOW_DAYS_EXTENDED)) &
+                                  (dnd["posting_date"] <= rd + pd.Timedelta(days=NOTE_WINDOW_DAYS+NOTE_WINDOW_DAYS_EXTENDED))]
                         dnd = dnd[(dnd["amount"].abs().sub(amount).abs() <= AMOUNT_TOL)]
                         if not dnd.empty:
                             chosen = dnd.sort_values("posting_date").iloc[0]
@@ -936,12 +1040,12 @@ def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, 
 
         overpay_debits = d_with_repay[
             (d_with_repay.get("match_type", "").astype(str).str.contains("overpay", case=False, na=False)) |
-            (d_with_repay["description"].str.contains("Online Transfer", case=False, na=False))
+            (d_with_repay["description"].str.contains(OVERPAY_DESC_PATTERN, case=False, na=False))
         ]
 
         funder_debits = d_with_repay[
             ~(d_with_repay.get("match_type", "").astype(str).str.contains("overpay", case=False, na=False)) &
-            ~(d_with_repay["description"].str.contains("Online Transfer", case=False, na=False))
+            ~(d_with_repay["description"].str.contains(OVERPAY_DESC_PATTERN, case=False, na=False))
         ]
 
         overpay_debits_per = (overpay_debits.groupby("claim_id", dropna=False)["chase_amount"].apply(lambda s: s.abs().sum())
@@ -1152,7 +1256,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
             logger.info(f"Pre-filtering {len(recontag_credit_indices)} ReconTag credits from main matching algorithm")
 
     # Debits
-    d_match, d_un, d_orph, dup, used_debit_idx = match_debits_relaxed(r2d, chase)
+    d_match, d_un, d_orph, dup, used_debit_idx, ach_id_conflicts = match_debits_relaxed(r2d, chase)
 
     # Credits (+ overpay) - pass ReconTag indices to exclude from matching
     # Create a modified chase dataframe that excludes ReconTag credits
