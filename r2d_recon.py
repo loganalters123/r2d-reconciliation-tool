@@ -1522,49 +1522,8 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         # Sheet 3: Unmatched_Combined (exceptions requiring attention)
         combined.to_excel(w, "Unmatched_Combined", index=False)
 
-        # Sheet 4: Data_Quality_Issues (ACH ID conflicts and validation warnings)
-        if ach_id_conflicts:
-            conflict_rows = []
-            for conflict in ach_id_conflicts:
-                for claim in conflict['claims']:
-                    conflict_rows.append({
-                        'ACH_ID': conflict['ach_id'],
-                        'Issue_Type': 'ACH ID Shared Across Different Claims',
-                        'Claimant': claim['claimant'],
-                        'Claim_ID': claim['claim_id'],
-                        'Amount': claim['amount'],
-                        'Date': claim['date'],
-                        'Conflict_Group_Size': len(conflict['claims']),
-                        'Resolution_Required': 'Review source file - same ACH ID used by different people/claims'
-                    })
-
-            conflicts_df = pd.DataFrame(conflict_rows)
-            conflicts_df.to_excel(w, "Data_Quality_Issues", index=False)
-        else:
-            # Create empty sheet with headers if no conflicts
-            empty_conflicts = pd.DataFrame(columns=[
-                'ACH_ID', 'Issue_Type', 'Claimant', 'Claim_ID', 'Amount', 'Date',
-                'Conflict_Group_Size', 'Resolution_Required'
-            ])
-            empty_conflicts.to_excel(w, "Data_Quality_Issues", index=False)
-
-        # Write remaining sheets in logical order
-        d_match.to_excel(w, "Debit_Matches", index=False)
-        d_un.to_excel(w, "Debit_Unmatched", index=False)
-        debits_orphans_final.to_excel(w, "CHASE_Unmatched_Debits", index=False)
-        c_match.to_excel(w, "Credit_Matches", index=False)
-        c_un_claims.to_excel(w, "Claims_Unmatched_Credits", index=False)
-        credits_unmatched_final.to_excel(w, "CHASE_Unmatched_Credits", index=False)
-        over_adj.to_excel(w, "Overpayment_Adjustments", index=False)
-        note_c.to_excel(w, "Note_Matched_Credits", index=False)
-        note_d.to_excel(w, "Note_Matched_Debits", index=False)
-        bank_revenue_summary.to_excel(w, "Bank_Revenue_Summary", index=False)
+        # Sheet 4: Summary (overview statistics)
         summary.to_excel(w, "Summary", index=False)
-        pd.DataFrame([{"duplicates_removed_by_ach_id": dup}]).to_excel(w, "Stats", index=False)
-        (excluded_debits_by_date if isinstance(excluded_debits_by_date, pd.DataFrame) else pd.DataFrame()
-        ).to_excel(w, "Excluded_Unmatched_Debits", index=False)
-        (excluded_dun_by_ti if isinstance(excluded_dun_by_ti, pd.DataFrame) else pd.DataFrame()
-        ).to_excel(w, "Excluded_Debit_Unmatched", index=False)
 
     logger.info(f"✓ Reconciliation complete. Output written to: {out_path}")
 
