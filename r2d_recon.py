@@ -523,6 +523,9 @@ def _prepare_credit_matching_data(r2d):
     """
     Prepare and aggregate repayment data for credit matching.
 
+    Aggregates by claim_id. Note: Claims with multiple transfers (different ACH IDs)
+    will have their repayments summed. These should be reviewed in the source file.
+
     Args:
         r2d: DataFrame with repayment data
 
@@ -535,6 +538,8 @@ def _prepare_credit_matching_data(r2d):
     tmp["overpaid_val"] = tmp["notes"].apply(parse_overpaid_amount)
 
     parents = tmp.groupby("claim_id", dropna=False).apply(canonical_parent).reset_index(drop=True)
+
+    # Group by claim_id (aggregates multiple transfers together)
     roll = tmp.groupby("claim_id", dropna=False).agg(
         repayment_sum=("repayment_amount","sum"),
         amount_to_funder_sum=("amount_to_funder","sum"),
@@ -1111,7 +1116,37 @@ def compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, 
     remaining = [c for c in out.columns if c not in existing]
     return out[existing + remaining]
 
-def build_summary(d_match, d_un, d_orph, c_match, note_c, note_d):
+def detect_multiple_transfers(r2d):
+    """
+    Detect claims that have multiple transfers (different ACH IDs and transfer dates).
+    These may cause reconciliation issues and should be reviewed.
+
+    Returns:
+        DataFrame with claims that have multiple transfers
+    """
+    # Group by claim_id and check for multiple unique ACH IDs or transfer dates
+    grouped = r2d.groupby("claim_id").agg({
+        "ach_id": lambda x: x.nunique(),
+        "window_date": lambda x: x.nunique(),
+        "claimant": "first",
+        "repayment_amount": "sum",
+        "amount_to_funder": "sum"
+    }).reset_index()
+
+    # Find claims with multiple ACH IDs (different transfers)
+    multiple_transfers = grouped[grouped["ach_id"] > 1].copy()
+
+    if not multiple_transfers.empty:
+        multiple_transfers = multiple_transfers.rename(columns={
+            "ach_id": "transfer_count",
+            "window_date": "unique_dates"
+        })
+        return multiple_transfers[["claim_id", "claimant", "transfer_count", "unique_dates", "repayment_amount", "amount_to_funder"]]
+
+    return pd.DataFrame()
+
+
+def build_summary(d_match, d_un, d_orph, c_match, note_c, note_d, multiple_transfers_df=None):
     total_d = r2(d_match["chase_amount"].abs().sum(), 2) if not d_match.empty else 0.0
     total_c = r2(c_match["chase_credit_amount"].sum(), 2) if not c_match.empty else 0.0
     total_c_notes = r2(note_c["matched_credit_amount"].sum(), 2) if not note_c.empty else 0.0
@@ -1120,7 +1155,7 @@ def build_summary(d_match, d_un, d_orph, c_match, note_c, note_d):
     total_c_all = r2((total_c or 0) + (total_c_notes or 0), 2)
     net_after_notes = r2((total_d_all or 0) - (total_c_all or 0), 2)
 
-    return pd.DataFrame({"metric":[
+    metrics = [
         "Debits matched (count)",
         "Credits matched (count)",
         "Note-derived debit matches (count)",
@@ -1130,13 +1165,21 @@ def build_summary(d_match, d_un, d_orph, c_match, note_c, note_d):
         "Net diff after notes (debits - credits)",
         "Debits unmatched (count)",
         "CHASE unmatched debits (count)"
-    ], "value":[
+    ]
+    values = [
         len(d_match), len(c_match),
         (0 if note_d.empty else len(note_d)),
         (0 if note_c.empty else len(note_c)),
         total_d_all, total_c_all, net_after_notes,
         len(d_un), len(d_orph)
-    ]})
+    ]
+
+    # Add warning about multiple transfers if any found
+    if multiple_transfers_df is not None and not multiple_transfers_df.empty:
+        metrics.append("⚠️ Claims with multiple transfers")
+        values.append(len(multiple_transfers_df))
+
+    return pd.DataFrame({"metric": metrics, "value": values})
 
 def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un_claims, d_un=None, reconciled_credit_claims=None, reconciled_debit_claims=None, expected_overpay_missing=None):
     reconciled_credit_claims = reconciled_credit_claims or set()
@@ -1318,8 +1361,14 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
                 excluded_dun_by_ti = d_un.loc[mask2].copy()
                 d_un = d_un.loc[~mask2].copy()
 
+    # Detect claims with multiple transfers for data quality review
+    multiple_transfers_df = detect_multiple_transfers(r2d)
+    if not multiple_transfers_df.empty:
+        logger.warning(f"⚠️  Found {len(multiple_transfers_df)} claim(s) with multiple transfers - review source file!")
+        logger.warning(f"Claims: {', '.join(multiple_transfers_df['claimant'].tolist())}")
+
     # Summary & base per-claim revenue
-    summary = build_summary(d_match, d_un, debits_orphans_final, c_match, note_c, note_d)
+    summary = build_summary(d_match, d_un, debits_orphans_final, c_match, note_c, note_d, multiple_transfers_df)
     per_claim_rev = compute_bank_revenue_per_claim(d_match, c_match, note_c, note_d, per_claim, over_adj)
 
     # Add ReconTagged credits to Bank Credits (Effective)
