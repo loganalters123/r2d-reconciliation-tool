@@ -1204,18 +1204,45 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
         # Only exclude R2D unmatched debits if they were specifically matched as debits
         if reconciled_debit_claims:
             d_unmatched = d_unmatched.loc[~d_unmatched["claim_id"].astype(str).isin(reconciled_debit_claims)].copy()
-        
+
         if not d_unmatched.empty:
+            # Deduplicate by claim_id to avoid showing AFR variations multiple times
+            # Use canonical parent to get the main claimant name (non-AFR preferred)
+            def get_parent_row(group):
+                # Check deal_type if available, prefer non-AFR
+                if "deal_type" in group.columns:
+                    group["is_afr_temp"] = group["deal_type"].astype(str).str.contains(r"\bafr", case=False, na=False)
+                    non_afr = group[~group["is_afr_temp"]]
+                    if not non_afr.empty:
+                        return non_afr.iloc[0]
+                return group.iloc[0]
+
+            parents = d_unmatched.groupby("claim_id", dropna=False).apply(get_parent_row).reset_index(drop=True)
+
+            # Group by claim_id and aggregate amounts
+            d_unmatched_grouped = d_unmatched.groupby("claim_id", dropna=False).agg({
+                "transfer_initiated": "max",  # Latest transfer date
+                "amount_transferred": "sum",  # Sum all transfer amounts
+                "notes": lambda x: " | ".join([str(n) for n in x.dropna() if str(n).strip()]) if x.notna().any() else pd.NA
+            }).reset_index()
+
+            # Merge with parent claimant names
+            d_unmatched_grouped = d_unmatched_grouped.merge(
+                parents[["claim_id", "claimant"]],
+                on="claim_id",
+                how="left"
+            )
+
             # Use transfer_initiated as date, amount_transferred as amount
             rename_map = {"transfer_initiated":"date","amount_transferred":"amount","notes":"notes","claimant":"claimant","claim_id":"claim_id"}
-            d_unmatched = d_unmatched.rename(columns=rename_map)
-            if "date" not in d_unmatched.columns and "transfer_initiated" in d_unmatched.columns:
-                d_unmatched["date"] = d_unmatched["transfer_initiated"]
-            if "amount" not in d_unmatched.columns and "amount_transferred" in d_unmatched.columns:
-                d_unmatched["amount"] = d_unmatched["amount_transferred"]
-            d_unmatched = d_unmatched.assign(category="R2D_Unmatched_Debit (transfer)")
-            d_unmatched["description"] = pd.NA
-            d_unmatched = d_unmatched[["category","claim_id","claimant","date","amount","description","notes"]]
+            d_unmatched_grouped = d_unmatched_grouped.rename(columns=rename_map)
+            if "date" not in d_unmatched_grouped.columns and "transfer_initiated" in d_unmatched_grouped.columns:
+                d_unmatched_grouped["date"] = d_unmatched_grouped["transfer_initiated"]
+            if "amount" not in d_unmatched_grouped.columns and "amount_transferred" in d_unmatched_grouped.columns:
+                d_unmatched_grouped["amount"] = d_unmatched_grouped["amount_transferred"]
+            d_unmatched_grouped = d_unmatched_grouped.assign(category="R2D_Unmatched_Debit (transfer)")
+            d_unmatched_grouped["description"] = pd.NA
+            d_unmatched = d_unmatched_grouped[["category","claim_id","claimant","date","amount","description","notes"]]
         else:
             d_unmatched = None
             
