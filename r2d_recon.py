@@ -36,7 +36,7 @@ NOTE_WINDOW_DAYS = 7  # Days tolerance for note-based matching
 NOTE_WINDOW_DAYS_EXTENDED = 3  # Additional days for fallback note matching
 
 # Amount matching
-AMOUNT_TOL = 0.01  # Amount matching tolerance in dollars (1 cent)
+AMOUNT_TOL = 0.02  # Amount matching tolerance in dollars (2 cents to account for floating point errors)
 
 # Confidence scoring
 MAX_CONFIDENCE = 0.99  # Maximum confidence score cap for matches
@@ -55,7 +55,7 @@ CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\
 DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\s*out|2670)", re.I)
 SEND_FUNDER_REGEX = re.compile(r"(?:to\s+)?send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 RECEIVED_CHECK_REGEX = re.compile(r"(received.*?check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by|received\s+for).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
-REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining|requesting\s+remaining).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 
 # Shared check detection patterns
 SHARED_CHECK_PATTERNS = re.compile(r"(?:check.*addressed\s+for\s+(\d+)\s+clients?|(\d+)\s+clients?|other\s+client\s+is\s+([^,)]+))", re.I)
