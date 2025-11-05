@@ -353,13 +353,14 @@ def dedupe_by_ach_id(r2d: pd.DataFrame):
     with_id = r2d[r2d["ach_id"].astype(str).str.len() > 0]
     without_id = r2d[r2d["ach_id"].astype(str).str.len() == 0]
 
-    # Only remove true duplicates (same ACH ID + same claim ID + same claimant)
+    # Remove duplicates by ACH ID + claim ID (same transfer, different claimant name variations)
+    # This handles cases like "Stacy Chambers", "Stacy Chambers (AFR)", etc. with same ACH ID
     before_count = len(with_id)
-    kept = with_id.drop_duplicates(subset=["ach_id", "claim_id", "claimant"], keep="first").copy()
+    kept = with_id.drop_duplicates(subset=["ach_id", "claim_id"], keep="first").copy()
     removed_count = before_count - len(kept)
 
     if removed_count > 0:
-        logger.info(f"📋 Removed {removed_count} true duplicate entries (same ACH ID + same claim + same claimant)")
+        logger.info(f"📋 Removed {removed_count} duplicate entries (same ACH ID + same claim)")
 
     return pd.concat([kept, without_id], ignore_index=True), removed_count, conflicts
 
