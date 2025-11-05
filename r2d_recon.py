@@ -1220,11 +1220,23 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
             parents = d_unmatched.groupby("claim_id", dropna=False).apply(get_parent_row).reset_index(drop=True)
 
             # Group by claim_id and aggregate amounts
+            # For amount_transferred: if all rows have same ACH ID, it's the same transfer (take first)
+            # If different ACH IDs, sum them (multiple actual transfers)
+            # Check ACH IDs per claim first
+            ach_id_counts = d_unmatched.groupby("claim_id")["ach_id"].nunique() if "ach_id" in d_unmatched.columns else pd.Series()
+
             d_unmatched_grouped = d_unmatched.groupby("claim_id", dropna=False).agg({
                 "transfer_initiated": "max",  # Latest transfer date
-                "amount_transferred": "sum",  # Sum all transfer amounts
+                "amount_transferred": "first",  # Take first (will fix for multiple ACH IDs below)
                 "notes": lambda x: " | ".join([str(n) for n in x.dropna() if str(n).strip()]) if x.notna().any() else pd.NA
             }).reset_index()
+
+            # For claims with multiple unique ACH IDs, sum the amounts instead
+            if not ach_id_counts.empty:
+                for claim_id in ach_id_counts[ach_id_counts > 1].index:
+                    claim_rows = d_unmatched[d_unmatched["claim_id"] == claim_id]
+                    total_amount = claim_rows["amount_transferred"].sum()
+                    d_unmatched_grouped.loc[d_unmatched_grouped["claim_id"] == claim_id, "amount_transferred"] = total_amount
 
             # Merge with parent claimant names
             d_unmatched_grouped = d_unmatched_grouped.merge(
