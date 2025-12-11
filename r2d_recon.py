@@ -536,6 +536,7 @@ def _prepare_credit_matching_data(r2d):
     tmp = r2d.copy()
     tmp["repayment_amount"] = pd.to_numeric(tmp["repayment_amount"], errors="coerce")
     tmp["amount_to_funder"] = pd.to_numeric(tmp["amount_to_funder"], errors="coerce")
+    tmp["amount_transferred"] = pd.to_numeric(tmp["amount_transferred"], errors="coerce")
     tmp["overpaid_val"] = tmp["notes"].apply(parse_overpaid_amount)
 
     parents = tmp.groupby("claim_id", dropna=False).apply(canonical_parent).reset_index(drop=True)
@@ -544,6 +545,7 @@ def _prepare_credit_matching_data(r2d):
     roll = tmp.groupby("claim_id", dropna=False).agg(
         repayment_sum=("repayment_amount","sum"),
         amount_to_funder_sum=("amount_to_funder","sum"),
+        amount_transferred_sum=("amount_transferred","sum"),
         ref_date=("window_date","max"),
         overpaid_sum=("overpaid_val","max"),
         notes_any=("notes"," | ".join)
@@ -557,24 +559,36 @@ def _setup_priority_sorting(roll):
     """
     Add priority columns for claims with identical amounts.
 
+    When multiple claims have the same repayment amount, prioritize claims where
+    the amount_transferred is closer to the repayment amount. This helps match
+    the "main" claim (with the full payment) before partial claims.
+
+    For example, if repayment = $2312.93:
+    - Claim A with amount_transferred = $2250.79 (diff = $62.14) gets priority
+    - Claim B with amount_transferred = $179.19 (diff = $2133.74) is secondary
+
     Args:
         roll: Rolled-up claims data
 
     Returns:
         DataFrame with priority columns and sorted
     """
-    # Priority allocation for identical repayment amounts
-    # Define priority order for claims with amount $2312.93
-    PRIORITY_2312_93 = ['Nina Brown', 'Jamie Bagwell', 'Levi Hoerner', 'Evelyn Gaines', 'Raymundo Ramirez Villanuena']
+    # Calculate how close amount_transferred is to repayment_sum
+    # Smaller difference = higher priority (processed first)
+    # This prioritizes "main" payments over partial payments
+    roll['transferred_repayment_diff'] = (
+        roll['repayment_sum'].fillna(0) - roll['amount_transferred_sum'].fillna(0)
+    ).abs()
 
-    # Add priority columns for sorting
-    roll['is_priority_2312'] = (roll['repayment_sum'] - 2312.93).abs() <= 0.01
-    roll['priority_index'] = roll.apply(lambda row:
-        PRIORITY_2312_93.index(row['claimant']) if row['is_priority_2312'] and row['claimant'] in PRIORITY_2312_93
-        else 999, axis=1)
+    # Group claims by their repayment_sum (rounded to 2 decimals for comparison)
+    roll['repayment_group'] = roll['repayment_sum'].round(2)
 
-    # Sort: priority 2312.93 claims first by priority order, then all others
-    return roll.sort_values(['is_priority_2312', 'priority_index'], ascending=[False, True]).reset_index(drop=True)
+    # Within each repayment amount group, sort by transferred_repayment_diff (ascending)
+    # This ensures claims with amount_transferred closest to repayment get priority
+    return roll.sort_values(
+        ['repayment_group', 'transferred_repayment_diff'],
+        ascending=[False, True]
+    ).reset_index(drop=True)
 
 
 def _find_overpay_debit(debits, over_x, credit_date, ref_date, used_overpay_debit):
@@ -822,39 +836,42 @@ def extract_note_events(text, ref_date):
     dates = [pd.Timestamp(year=year, month=int(m), day=int(d), tz=None) for m, d in DATE_IN_NOTES.findall(text)]
     anchor = dates[-1] if dates else ref_date
 
-    # Collect amounts to ignore (requested remaining amounts in wrong context)
+    # First, identify amounts that were explicitly RECEIVED (these are credits)
+    received_amounts = set()
+    for m in RECEIVED_CHECK_REGEX.finditer(text):
+        amt = r2(m.group(2).replace(",",""))
+        if amt is not None:
+            received_amounts.add(amt)
+            events.append(("credit_expected", amt, anchor))
+
+    # Collect amounts to ignore (requested remaining amounts that were NOT also received)
     amounts_to_ignore = set()
 
-    # Check if note contains "received rem" pattern - if so, "req rem" amounts are credits received
-    has_received_rem = bool(re.search(r'received\s+rem|rem\.?\s+repayment\s+received|remaining\s+repayment.*?received', text, re.I))
-
+    # Process "req rem" amounts - these are typically amounts being REQUESTED from law firm
+    # Only ignore if the amount wasn't already captured as a "received" amount
     for m in REQUESTED_REMAINING_REGEX.finditer(text):
         amt = r2(m.group(2).replace(",",""))
         if amt is not None:
-            # If note has "received rem", then "req rem $X" means they received $X
-            if has_received_rem:
-                events.append(("credit_expected", amt, anchor))
-            else:
-                # Check context around this match to see if it should actually be a credit expectation
-                start, end = max(0, m.start()-50), min(len(text), m.end()+50)
-                context = text[start:end].lower()
+            # If this amount was already identified as received, don't ignore it
+            if amt in received_amounts:
+                continue
 
-                # If "req. rem." follows context indicating money is owed, treat as credit expectation
-                credit_context_keywords = ['underpaid', 'owed', 'owes', 'balance', 'paid prev', 'bracket', 'partial', 'insufficient']
-                if any(keyword in context for keyword in credit_context_keywords):
-                    events.append(("credit_expected", amt, anchor))
-                else:
-                    # Only ignore if it's truly a "requested remaining" in neutral context
-                    amounts_to_ignore.add(amt)
+            # Check context around this specific "req rem" match
+            start, end = max(0, m.start()-50), min(len(text), m.end()+50)
+            context = text[start:end].lower()
+
+            # "req rem ... from LF" or "requesting remaining from" means money is being REQUESTED
+            # This is NOT a credit received - it should be ignored
+            if 'from lf' in context or 'from law firm' in context or 'requesting' in context:
+                amounts_to_ignore.add(amt)
+            else:
+                # Default: "req rem" without clear context should be ignored (it's a request, not receipt)
+                amounts_to_ignore.add(amt)
 
     for m in SEND_FUNDER_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
         if amt is not None and amt not in amounts_to_ignore:
             events.append(("debit_expected", amt, anchor))
-    for m in RECEIVED_CHECK_REGEX.finditer(text):
-        amt = r2(m.group(2).replace(",",""))
-        if amt is not None and amt not in amounts_to_ignore:
-            events.append(("credit_expected", amt, anchor))
 
     for m in DOLLAR_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
