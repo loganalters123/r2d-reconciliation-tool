@@ -55,7 +55,7 @@ CREDIT_KEYWORDS = re.compile(r"(received|deposit|check|credited|incoming|rec\.?\
 DEBIT_KEYWORDS  = re.compile(r"(send\s+funder|to\s+funder|transfer|outgoing|ach\s*out|2670)", re.I)
 SEND_FUNDER_REGEX = re.compile(r"(?:to\s+)?send\s+funder[^$]*\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 RECEIVED_CHECK_REGEX = re.compile(r"(received.*?check|rec\.?\s*rem|received\s+rem|received\s+remaining|remaining\s+repayment|repayment\s+received|underpaid\s+by|received\s+for).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
-REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining|requesting\s+remaining).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
+REQUESTED_REMAINING_REGEX = re.compile(r"(req\.?\s*rem\.?|requested\s+rem\.?|req\.?\s*remaining|requested\s+remaining|requesting\s+remaining|requesting\s+rem|underpayment\s+of).*?\$([0-9][0-9,]*\.[0-9]{2})", re.I)
 
 # Shared check detection patterns
 SHARED_CHECK_PATTERNS = re.compile(r"(?:check.*addressed\s+for\s+(\d+)\s+clients?|(\d+)\s+clients?|other\s+client\s+is\s+([^,)]+))", re.I)
@@ -836,37 +836,41 @@ def extract_note_events(text, ref_date):
     dates = [pd.Timestamp(year=year, month=int(m), day=int(d), tz=None) for m, d in DATE_IN_NOTES.findall(text)]
     anchor = dates[-1] if dates else ref_date
 
-    # First, identify amounts that were explicitly RECEIVED (these are credits)
-    received_amounts = set()
-    for m in RECEIVED_CHECK_REGEX.finditer(text):
-        amt = r2(m.group(2).replace(",",""))
-        if amt is not None:
-            received_amounts.add(amt)
-            events.append(("credit_expected", amt, anchor))
+    # Check if note indicates remaining repayment was received
+    # Patterns: "rem. repayment received", "received rem. repayment", "remaining repayment received"
+    has_rem_received = bool(re.search(r'rem\.?\s*repayment\s+received|remaining\s+repayment\s+received|received\s+rem\.?\s*repayment', text, re.I))
 
-    # Collect amounts to ignore (requested remaining amounts that were NOT also received)
-    amounts_to_ignore = set()
-
-    # Process "req rem" amounts - these are typically amounts being REQUESTED from law firm
-    # Only ignore if the amount wasn't already captured as a "received" amount
+    # Collect all "req rem" amounts - these might be credits if rem repayment was received
+    req_rem_amounts = []
     for m in REQUESTED_REMAINING_REGEX.finditer(text):
         amt = r2(m.group(2).replace(",",""))
         if amt is not None:
-            # If this amount was already identified as received, don't ignore it
-            if amt in received_amounts:
+            req_rem_amounts.append(amt)
+
+    # If note says "rem. repayment received" and has req rem amounts, those are credits
+    received_amounts = set()
+    if has_rem_received and req_rem_amounts:
+        for amt in req_rem_amounts:
+            received_amounts.add(amt)
+            events.append(("credit_expected", amt, anchor))
+
+    # Also check RECEIVED_CHECK_REGEX for explicit "received $X" patterns
+    # But be careful not to match "to send funder $X" amounts
+    for m in RECEIVED_CHECK_REGEX.finditer(text):
+        amt = r2(m.group(2).replace(",",""))
+        if amt is not None and amt not in received_amounts:
+            # Check if this amount appears right after "to send funder" - if so, it's a debit not credit
+            match_text = m.group(0)
+            if 'send funder' in match_text.lower() or 'to funder' in match_text.lower():
                 continue
+            received_amounts.add(amt)
+            events.append(("credit_expected", amt, anchor))
 
-            # Check context around this specific "req rem" match
-            start, end = max(0, m.start()-50), min(len(text), m.end()+50)
-            context = text[start:end].lower()
-
-            # "req rem ... from LF" or "requesting remaining from" means money is being REQUESTED
-            # This is NOT a credit received - it should be ignored
-            if 'from lf' in context or 'from law firm' in context or 'requesting' in context:
-                amounts_to_ignore.add(amt)
-            else:
-                # Default: "req rem" without clear context should be ignored (it's a request, not receipt)
-                amounts_to_ignore.add(amt)
+    # Collect amounts to ignore (requested remaining that weren't received)
+    amounts_to_ignore = set()
+    for amt in req_rem_amounts:
+        if amt not in received_amounts:
+            amounts_to_ignore.add(amt)
 
     for m in SEND_FUNDER_REGEX.finditer(text):
         amt = r2(m.group(1).replace(",",""))
@@ -894,6 +898,19 @@ def extract_note_events(text, ref_date):
     return uniq
 
 def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
+    """
+    Detect expected credits/debits from notes but DO NOT auto-match credits.
+
+    Credits: Only DETECT and report as "Missing ReconTag" - do not match.
+    Debits: Still match (debits are less risky as they're outgoing payments).
+
+    Returns:
+        note_credit_df: Empty (no auto-matching)
+        note_debit_df: Matched debits from notes
+        newly_used_credit: Empty set
+        newly_used_debit: Set of matched debit indices
+        missing_recontags: DataFrame of claims that need ReconTags
+    """
     credits = chase[chase["is_credit"]].copy()
     debits  = chase[chase["is_debit"]].copy()
 
@@ -904,94 +921,51 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
     roll = pd.DataFrame({"claim_id": ref_date.index, "ref_date": ref_date.values, "notes_any": notes_join.values, "claimant": claimant.values})
     roll["claimant_display"] = roll["claimant"].astype(str).str.replace(PAREN_SUFFIX, "", regex=True)
 
-    note_credit_rows, note_debit_rows = [], []
-    newly_used_credit, newly_used_debit = set(), set()
+    # No longer auto-match credits from notes
+    note_credit_rows = []
+    note_debit_rows = []
+    missing_recontag_rows = []
+    newly_used_credit = set()  # Will stay empty - no credit matching
+    newly_used_debit = set()
 
     for _, r in roll.iterrows():
         events = extract_note_events(r["notes_any"], r["ref_date"])
         for kind, amount, anchor_date in events:
             if kind == "credit_expected":
-                # Check if this is a shared check
-                is_shared, client_count, other_client_names = detect_shared_check(r["notes_any"])
-                
-                cnd = credits.loc[~credits.index.isin(used_credit_idx + list(newly_used_credit))].copy()
+                # DO NOT auto-match credits - instead report as needing ReconTag
+                # Check if there's a potential matching credit (for reporting purposes)
+                cnd = credits.loc[~credits.index.isin(used_credit_idx)].copy()
                 if pd.notna(anchor_date):
                     cnd = cnd[(cnd["posting_date"] >= anchor_date - pd.Timedelta(days=NOTE_WINDOW_DAYS)) &
                               (cnd["posting_date"] <= anchor_date + pd.Timedelta(days=NOTE_WINDOW_DAYS))]
                 cnd = cnd[(cnd["amount"].sub(amount).abs() <= AMOUNT_TOL)]
-                chosen = None
+
+                potential_match = None
                 if not cnd.empty:
-                    chosen = cnd.sort_values("posting_date").iloc[0]
+                    potential_match = cnd.sort_values("posting_date").iloc[0]
                 else:
                     rd = r["ref_date"]
                     if pd.notna(rd):
-                        cnd = credits.loc[~credits.index.isin(used_credit_idx + list(newly_used_credit))].copy()
+                        cnd = credits.loc[~credits.index.isin(used_credit_idx)].copy()
                         cnd = cnd[(cnd["posting_date"] >= rd - pd.Timedelta(days=NOTE_WINDOW_DAYS+NOTE_WINDOW_DAYS_EXTENDED)) &
                                   (cnd["posting_date"] <= rd + pd.Timedelta(days=NOTE_WINDOW_DAYS+NOTE_WINDOW_DAYS_EXTENDED))]
                         cnd = cnd[(cnd["amount"].sub(amount).abs() <= AMOUNT_TOL)]
                         if not cnd.empty:
-                            chosen = cnd.sort_values("posting_date").iloc[0]
-                
-                if chosen is not None:
-                    newly_used_credit.add(chosen.name)
-                    
-                    if is_shared and client_count > 1:
-                        # For shared checks, split the amount proportionally
-                        # For now, split equally among clients (can be enhanced later to use repayment amounts)
-                        split_amount = chosen["amount"] / client_count
-                        
-                        # Add entry for current client
-                        note_credit_rows.append({
-                            "claim_id": r["claim_id"],
-                            "claimant": r["claimant_display"],
-                            "note_amount": amount,
-                            "matched_credit_date": chosen["posting_date"],
-                            "matched_credit_amount": split_amount,
-                            "matched_credit_desc": chosen["description"] + f" (shared {client_count} ways)",
-                            "source": "notes_shared"
-                        })
-                        
-                        # Try to find and add entries for other clients mentioned in notes
-                        for other_client in other_client_names:
-                            # Try to find the claim_id for the other client
-                            other_client_clean = other_client.strip()
-                            matching_claims = roll[roll["claimant_display"].str.contains(other_client_clean, case=False, na=False)]
-                            
-                            if not matching_claims.empty:
-                                other_claim = matching_claims.iloc[0]
-                                note_credit_rows.append({
-                                    "claim_id": other_claim["claim_id"],
-                                    "claimant": other_claim["claimant_display"],
-                                    "note_amount": amount,
-                                    "matched_credit_date": chosen["posting_date"],
-                                    "matched_credit_amount": split_amount,
-                                    "matched_credit_desc": chosen["description"] + f" (shared {client_count} ways)",
-                                    "source": "notes_shared"
-                                })
-                            else:
-                                # Create placeholder entry for unknown other client
-                                note_credit_rows.append({
-                                    "claim_id": f"UNKNOWN_{other_client_clean}",
-                                    "claimant": other_client_clean,
-                                    "note_amount": amount,
-                                    "matched_credit_date": chosen["posting_date"],
-                                    "matched_credit_amount": split_amount,
-                                    "matched_credit_desc": chosen["description"] + f" (shared {client_count} ways)",
-                                    "source": "notes_shared_unknown"
-                                })
-                    else:
-                        # Regular (non-shared) credit matching
-                        note_credit_rows.append({
-                            "claim_id": r["claim_id"],
-                            "claimant": r["claimant_display"],
-                            "note_amount": amount,
-                            "matched_credit_date": chosen["posting_date"],
-                            "matched_credit_amount": chosen["amount"],
-                            "matched_credit_desc": chosen["description"],
-                            "source": "notes"
-                        })
+                            potential_match = cnd.sort_values("posting_date").iloc[0]
+
+                # Report this as needing a ReconTag
+                missing_recontag_rows.append({
+                    "claim_id": r["claim_id"],
+                    "claimant": r["claimant_display"],
+                    "expected_amount": amount,
+                    "note_excerpt": r["notes_any"][:200] + "..." if len(r["notes_any"]) > 200 else r["notes_any"],
+                    "potential_chase_credit": potential_match["amount"] if potential_match is not None else None,
+                    "potential_chase_date": potential_match["posting_date"] if potential_match is not None else None,
+                    "action_needed": f"Add ReconTag '{r['claim_id']}' to Chase credit of ${amount:.2f}"
+                })
 
             elif kind == "debit_expected":
+                # Still match debits (less risky - outgoing payments)
                 dnd = debits.loc[~debits.index.isin(used_debit_idx + list(newly_used_debit))].copy()
                 if pd.notna(anchor_date):
                     dnd = dnd[(dnd["posting_date"] >= anchor_date - pd.Timedelta(days=NOTE_WINDOW_DAYS)) &
@@ -1021,9 +995,10 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
                         "source": "notes"
                     })
 
-    note_credit_df = pd.DataFrame(note_credit_rows)
+    note_credit_df = pd.DataFrame(note_credit_rows)  # Will be empty
+    missing_recontags_df = pd.DataFrame(missing_recontag_rows)
     note_debit_df  = pd.DataFrame(note_debit_rows)
-    return note_credit_df, note_debit_df, list(newly_used_credit), list(newly_used_debit)
+    return note_credit_df, note_debit_df, list(newly_used_credit), list(newly_used_debit), missing_recontags_df
 
 # ------------------------- Revenue & Summary -------------------------
 
@@ -1371,8 +1346,9 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
     if used_overpay_debit:
         d_orph = d_orph.loc[~d_orph.index.isin(used_overpay_debit)].copy()
 
-    # Notes pass
-    note_c, note_d, newly_used_credit, newly_used_debit = \
+    # Notes pass - detects expected credits but does NOT auto-match them
+    # Credits need ReconTags for reliable matching
+    note_c, note_d, newly_used_credit, newly_used_debit, missing_recontags = \
         match_from_notes(r2d, chase, used_credit_idx, used_debit_idx)
 
     # Unmatched views (exclude note-derived uses)
@@ -1630,6 +1606,11 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
 
         # Sheet 4: Summary (overview statistics)
         summary.to_excel(w, "Summary", index=False)
+
+        # Sheet 5: Missing_ReconTags (claims that need ReconTags added to Chase)
+        if not missing_recontags.empty:
+            missing_recontags.to_excel(w, "Missing_ReconTags", index=False)
+            logger.warning(f"⚠️  {len(missing_recontags)} claims need ReconTags - see Missing_ReconTags sheet")
 
     logger.info(f"✓ Reconciliation complete. Output written to: {out_path}")
 
