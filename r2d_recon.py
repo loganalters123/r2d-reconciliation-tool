@@ -909,7 +909,7 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
         note_debit_df: Matched debits from notes
         newly_used_credit: Empty set
         newly_used_debit: Set of matched debit indices
-        missing_recontags: DataFrame of claims that need ReconTags
+        recontags_df: DataFrame of matched and suggested ReconTags (with status column)
     """
     credits = chase[chase["is_credit"]].copy()
     debits  = chase[chase["is_debit"]].copy()
@@ -924,14 +924,46 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
     # No longer auto-match credits from notes
     note_credit_rows = []
     note_debit_rows = []
-    missing_recontag_rows = []
+    matched_recontag_rows = []  # Claims that already have ReconTags
+    suggested_recontag_rows = []  # Claims that need ReconTags
     newly_used_credit = set()  # Will stay empty - no credit matching
     newly_used_debit = set()
+
+    # Build dict of claim IDs that already have ReconTagged credits (with their details)
+    recontag_credits = {}
+    if "recon_tag" in chase.columns:
+        tagged = chase[chase["is_credit"] & chase["recon_tag"].notna() & (chase["recon_tag"].astype(str).str.strip() != "")]
+        for _, row in tagged.iterrows():
+            cid = str(row["recon_tag"]).strip()
+            if cid not in recontag_credits:
+                recontag_credits[cid] = []
+            recontag_credits[cid].append({
+                "amount": row["amount"],
+                "date": row["posting_date"],
+                "description": row.get("description", "")[:50]
+            })
 
     for _, r in roll.iterrows():
         events = extract_note_events(r["notes_any"], r["ref_date"])
         for kind, amount, anchor_date in events:
             if kind == "credit_expected":
+                claim_id = str(r["claim_id"]).strip()
+
+                # Check if this claim already has a ReconTagged credit
+                if claim_id in recontag_credits:
+                    # Report as matched ReconTag
+                    for tagged_credit in recontag_credits[claim_id]:
+                        matched_recontag_rows.append({
+                            "status": "MATCHED",
+                            "claim_id": r["claim_id"],
+                            "claimant": r["claimant_display"],
+                            "expected_amount": amount,
+                            "matched_credit_amount": tagged_credit["amount"],
+                            "matched_credit_date": tagged_credit["date"],
+                            "note_excerpt": r["notes_any"][:150] + "..." if len(r["notes_any"]) > 150 else r["notes_any"],
+                        })
+                    continue
+
                 # DO NOT auto-match credits - instead report as needing ReconTag
                 # Check if there's a potential matching credit (for reporting purposes)
                 cnd = credits.loc[~credits.index.isin(used_credit_idx)].copy()
@@ -954,13 +986,14 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
                             potential_match = cnd.sort_values("posting_date").iloc[0]
 
                 # Report this as needing a ReconTag
-                missing_recontag_rows.append({
+                suggested_recontag_rows.append({
+                    "status": "SUGGESTED",
                     "claim_id": r["claim_id"],
                     "claimant": r["claimant_display"],
                     "expected_amount": amount,
-                    "note_excerpt": r["notes_any"][:200] + "..." if len(r["notes_any"]) > 200 else r["notes_any"],
                     "potential_chase_credit": potential_match["amount"] if potential_match is not None else None,
                     "potential_chase_date": potential_match["posting_date"] if potential_match is not None else None,
+                    "note_excerpt": r["notes_any"][:150] + "..." if len(r["notes_any"]) > 150 else r["notes_any"],
                     "action_needed": f"Add ReconTag '{r['claim_id']}' to Chase credit of ${amount:.2f}"
                 })
 
@@ -996,9 +1029,15 @@ def match_from_notes(r2d, chase, used_credit_idx, used_debit_idx):
                     })
 
     note_credit_df = pd.DataFrame(note_credit_rows)  # Will be empty
-    missing_recontags_df = pd.DataFrame(missing_recontag_rows)
     note_debit_df  = pd.DataFrame(note_debit_rows)
-    return note_credit_df, note_debit_df, list(newly_used_credit), list(newly_used_debit), missing_recontags_df
+
+    # Combine matched and suggested into one DataFrame with status column
+    # Matched tags first, then suggested
+    matched_df = pd.DataFrame(matched_recontag_rows)
+    suggested_df = pd.DataFrame(suggested_recontag_rows)
+    recontags_df = pd.concat([matched_df, suggested_df], ignore_index=True)
+
+    return note_credit_df, note_debit_df, list(newly_used_credit), list(newly_used_debit), recontags_df
 
 # ------------------------- Revenue & Summary -------------------------
 
@@ -1422,6 +1461,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
 
     # Process ReconTagged debits (overpayment returns)
     # These should be deducted from Bank Credits (Effective)
+    # BUT: exclude debits already accounted for in over_adj to avoid double-counting
     tagged_debit_sum_by_claim = pd.Series(dtype=float)
     tagged_debit_idx = set()
     if "recon_tag" in chase.columns:
@@ -1430,8 +1470,29 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
 
         if not tagged_debits.empty:
             tagged_debits["recon_tag"] = tagged_debits["recon_tag"].astype(str).str.strip()
-            # Sum the absolute values of debits by claim
-            tagged_debit_sum_by_claim = tagged_debits.groupby("recon_tag")["amount"].apply(lambda x: x.abs().sum())
+
+            # Exclude debits already in over_adj (matched via credit matching overpay logic)
+            # These are already deducted in compute_bank_revenue_per_claim
+            if over_adj is not None and not over_adj.empty:
+                # Build set of (claim_id, amount) pairs already processed
+                already_processed = set()
+                for _, oa in over_adj.iterrows():
+                    cid = str(oa.get("claim_id", "")).strip()
+                    amt = abs(float(oa.get("overpay_amount", 0)))
+                    if cid and amt > AMOUNT_TOL:
+                        already_processed.add((cid, round(amt, 2)))
+
+                # Filter out tagged debits that match already-processed overpayments
+                def not_already_processed(row):
+                    cid = str(row["recon_tag"]).strip()
+                    amt = round(abs(row["amount"]), 2)
+                    return (cid, amt) not in already_processed
+
+                tagged_debits = tagged_debits[tagged_debits.apply(not_already_processed, axis=1)]
+
+            # Sum the absolute values of remaining debits by claim
+            if not tagged_debits.empty:
+                tagged_debit_sum_by_claim = tagged_debits.groupby("recon_tag")["amount"].apply(lambda x: x.abs().sum())
             tagged_debit_idx = set(tagged_debits.index)
 
             # Deduct ReconTagged debits from Bank Credits (Effective)
@@ -1607,10 +1668,15 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         # Sheet 4: Summary (overview statistics)
         summary.to_excel(w, "Summary", index=False)
 
-        # Sheet 5: Missing_ReconTags (claims that need ReconTags added to Chase)
+        # Sheet 5: ReconTags (matched and suggested ReconTags)
         if not missing_recontags.empty:
-            missing_recontags.to_excel(w, "Missing_ReconTags", index=False)
-            logger.warning(f"⚠️  {len(missing_recontags)} claims need ReconTags - see Missing_ReconTags sheet")
+            missing_recontags.to_excel(w, "ReconTags", index=False)
+            matched_count = len(missing_recontags[missing_recontags.get("status", "") == "MATCHED"]) if "status" in missing_recontags.columns else 0
+            suggested_count = len(missing_recontags[missing_recontags.get("status", "") == "SUGGESTED"]) if "status" in missing_recontags.columns else 0
+            if matched_count > 0:
+                logger.info(f"✓ {matched_count} ReconTags matched")
+            if suggested_count > 0:
+                logger.warning(f"⚠️  {suggested_count} claims need ReconTags - see ReconTags sheet")
 
     logger.info(f"✓ Reconciliation complete. Output written to: {out_path}")
 
@@ -1629,7 +1695,8 @@ Examples:
     ap.add_argument("--file", required=True, help="Path to input Excel file")
     ap.add_argument("--r2d-sheet", default="Repayments to Date", help="Name of repayments sheet")
     ap.add_argument("--chase-sheet", default="Chase", help="Name of Chase transactions sheet")
-    ap.add_argument("--out", default="/Users/Logan/Downloads/Repayments_to_Date_recon-2025-10-29.xlsx", help="Output file path")
+    default_out = f"/Users/Logan/Downloads/Repayments_to_Date_recon-{date.today().isoformat()}.xlsx"
+    ap.add_argument("--out", default=default_out, help="Output file path (default: auto-dated)")
     ap.add_argument("--ignore-debits-before", default=None, help="YYYY-MM-DD: exclude unmatched CHASE debits before this date")
     ap.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
 
