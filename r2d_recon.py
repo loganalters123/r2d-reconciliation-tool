@@ -1565,6 +1565,63 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         expected_overpay_missing=expected_overpay_missing
     )
 
+    # Build Review Items - things that need attention
+    review_items = []
+
+    # 1. Overpayments detected but debit not found
+    if isinstance(c_match, pd.DataFrame) and not c_match.empty and "overpay_amount" in c_match.columns:
+        missing_overpay = c_match[(c_match["overpay_amount"].fillna(0) > AMOUNT_TOL) & (c_match["overpay_debit_date"].isna())]
+        for _, row in missing_overpay.iterrows():
+            review_items.append({
+                "category": "OVERPAY_DEBIT_MISSING",
+                "claim_id": row["claim_id"],
+                "claimant": row["claimant"],
+                "amount": row["overpay_amount"],
+                "details": f"Overpayment of ${row['overpay_amount']:.2f} detected in notes, but no matching debit found in Chase. Client refund may be pending.",
+                "action": "Verify if overpayment refund has been issued to client"
+            })
+
+    # 2. ReconTagged credits with overpayment notes but no tagged debit
+    if "recon_tag" in chase.columns:
+        for claim_id in tagged_sum_by_claim.index:
+            # Check if this claim has overpayment in notes
+            claim_rows = r2d[r2d["claim_id"] == claim_id]
+            for _, row in claim_rows.iterrows():
+                overpay_amt = parse_overpaid_amount(str(row.get("notes", "")))
+                if overpay_amt and overpay_amt > AMOUNT_TOL:
+                    # Check if there's a tagged debit for this claim
+                    tagged_debit_for_claim = chase[(chase["is_debit"]) &
+                                                    (chase["recon_tag"].astype(str).str.strip() == claim_id)]
+                    if tagged_debit_for_claim.empty:
+                        review_items.append({
+                            "category": "RECONTAG_OVERPAY_NO_DEBIT",
+                            "claim_id": claim_id,
+                            "claimant": row.get("claimant", ""),
+                            "amount": overpay_amt,
+                            "details": f"ReconTagged credit exists, overpayment of ${overpay_amt:.2f} in notes, but no ReconTagged debit found.",
+                            "action": "Add ReconTag to overpayment debit when issued, or verify if pending"
+                        })
+                    break  # Only report once per claim
+
+    # 3. Large Check variances (Bank - Book != 0)
+    if not per_claim_rev.empty and "Check (Bank - Book)" in per_claim_rev.columns:
+        large_variances = per_claim_rev[per_claim_rev["Check (Bank - Book)"].abs() > 10.00]
+        for _, row in large_variances.iterrows():
+            variance = row["Check (Bank - Book)"]
+            # Skip if already reported as overpay missing
+            if any(ri["claim_id"] == row["claim_id"] and ri["category"] in ["OVERPAY_DEBIT_MISSING", "RECONTAG_OVERPAY_NO_DEBIT"] for ri in review_items):
+                continue
+            review_items.append({
+                "category": "LARGE_VARIANCE",
+                "claim_id": row["claim_id"],
+                "claimant": row.get("Claimant", ""),
+                "amount": variance,
+                "details": f"Bank-based revenue differs from book by ${variance:.2f}",
+                "action": "Review claim for missing credits/debits or data entry issues"
+            })
+
+    review_df = pd.DataFrame(review_items)
+
     # Create Bank Revenue Summary
     bank_revenue_summary = pd.DataFrame()
     if not per_claim_rev.empty and "Bank-based Revenue" in per_claim_rev.columns:
@@ -1677,6 +1734,11 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
                 logger.info(f"✓ {matched_count} ReconTags matched")
             if suggested_count > 0:
                 logger.warning(f"⚠️  {suggested_count} claims need ReconTags - see ReconTags sheet")
+
+        # Sheet 6: Review_Items (things that need attention)
+        if not review_df.empty:
+            review_df.to_excel(w, "Review_Items", index=False)
+            logger.warning(f"⚠️  {len(review_df)} items need review - see Review_Items sheet")
 
     logger.info(f"✓ Reconciliation complete. Output written to: {out_path}")
 
