@@ -1667,7 +1667,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         
         # Write priority sheets in user-requested order
         # Sheet 1: Per_Claim_Revenue (primary business view)
-        per_claim_rev.to_excel(w, "Per_Claim_Revenue", index=False)
+        per_claim_rev.to_excel(w, sheet_name="Per_Claim_Revenue", index=False)
 
         # Sheet 2: Balance Analysis sheet with proper Excel formulas
         worksheet = workbook.add_worksheet("Balance_Analysis")
@@ -1732,14 +1732,14 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
         worksheet.set_column('C:C', 50)
 
         # Sheet 3: Unmatched_Combined (exceptions requiring attention)
-        combined.to_excel(w, "Unmatched_Combined", index=False)
+        combined.to_excel(w, sheet_name="Unmatched_Combined", index=False)
 
         # Sheet 4: Summary (overview statistics)
-        summary.to_excel(w, "Summary", index=False)
+        summary.to_excel(w, sheet_name="Summary", index=False)
 
         # Sheet 5: ReconTags (matched and suggested ReconTags)
         if not missing_recontags.empty:
-            missing_recontags.to_excel(w, "ReconTags", index=False)
+            missing_recontags.to_excel(w, sheet_name="ReconTags", index=False)
             matched_count = len(missing_recontags[missing_recontags.get("status", "") == "MATCHED"]) if "status" in missing_recontags.columns else 0
             suggested_count = len(missing_recontags[missing_recontags.get("status", "") == "SUGGESTED"]) if "status" in missing_recontags.columns else 0
             if matched_count > 0:
@@ -1749,7 +1749,7 @@ def run(file_path, r2d_sheet, chase_sheet, out_path, ignore_debits_before=None, 
 
         # Sheet 6: Review_Items (things that need attention)
         if not review_df.empty:
-            review_df.to_excel(w, "Review_Items", index=False)
+            review_df.to_excel(w, sheet_name="Review_Items", index=False)
             logger.warning(f"⚠️  {len(review_df)} items need review - see Review_Items sheet")
 
     logger.info(f"✓ Reconciliation complete. Output written to: {out_path}")
