@@ -381,7 +381,11 @@ def canonical_parent(row_group: pd.DataFrame) -> pd.Series:
     return parent
 
 def build_correlation_map(r2d: pd.DataFrame):
-    parents = r2d.groupby("claim_id", dropna=False).apply(canonical_parent).reset_index(drop=True)
+    parents = r2d.groupby("claim_id", dropna=False).apply(canonical_parent)
+    if "claim_id" not in parents.columns:
+        parents = parents.reset_index()
+    else:
+        parents = parents.reset_index(drop=True)
     corr = {}
     for _, p in parents.iterrows():
         claim = p.get("claim_id")
@@ -539,7 +543,11 @@ def _prepare_credit_matching_data(r2d):
     tmp["amount_transferred"] = pd.to_numeric(tmp["amount_transferred"], errors="coerce")
     tmp["overpaid_val"] = tmp["notes"].apply(parse_overpaid_amount)
 
-    parents = tmp.groupby("claim_id", dropna=False).apply(canonical_parent).reset_index(drop=True)
+    parents = tmp.groupby("claim_id", dropna=False).apply(canonical_parent)
+    if "claim_id" not in parents.columns:
+        parents = parents.reset_index()
+    else:
+        parents = parents.reset_index(drop=True)
 
     # Group by claim_id (aggregates multiple transfers together)
     roll = tmp.groupby("claim_id", dropna=False).agg(
