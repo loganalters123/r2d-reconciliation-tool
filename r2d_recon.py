@@ -1257,7 +1257,11 @@ def build_unmatched_combined(credits_unmatched_final, debits_orphans_final, c_un
                         return non_afr.iloc[0]
                 return group.iloc[0]
 
-            parents = d_unmatched.groupby("claim_id", dropna=False).apply(get_parent_row).reset_index(drop=True)
+            parents = d_unmatched.groupby("claim_id", dropna=False).apply(get_parent_row)
+            if "claim_id" not in parents.columns:
+                parents = parents.reset_index()
+            else:
+                parents = parents.reset_index(drop=True)
 
             # Group by claim_id and aggregate amounts
             # For amount_transferred: if all rows have same ACH ID, it's the same transfer (take first)
